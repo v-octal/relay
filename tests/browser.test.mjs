@@ -12,15 +12,15 @@ context.on('page', (page) => page.on('pageerror', (error) => errors.push(error.m
 try {
   const sender = await context.newPage();
   await sender.goto(baseUrl);
-  await sender.getByRole('heading', { name: 'A little less cloud.' }).waitFor();
+  await sender.getByRole('heading', { name: 'Send files directly to your other devices.' }).waitFor();
   await sender.locator('.upload-symbol svg').waitFor();
   await sender.waitForTimeout(1000);
   if (artifactPath) await sender.screenshot({ path: `${artifactPath}/relay-desktop.png`, fullPage: true });
   assert.equal(await sender.locator('body').evaluate((body) => body.scrollWidth <= window.innerWidth), true);
 
   await sender.getByRole('button', { name: 'How it works' }).click();
-  await sender.getByRole('heading', { name: 'From here to there, in three.' }).waitFor();
-  await sender.getByRole('button', { name: 'Sounds good' }).click();
+  await sender.getByRole('heading', { name: 'How it works' }).waitFor();
+  await sender.getByRole('button', { name: 'Got it' }).click();
   await sender.getByRole('button', { name: 'Settings', exact: true }).click();
   await sender.getByLabel('Device name', { exact: true }).fill('Studio laptop');
   await sender.getByRole('button', { name: 'Save changes' }).click();
@@ -30,10 +30,9 @@ try {
   if (artifactPath) await sender.screenshot({ path: `${artifactPath}/relay-dark.png`, fullPage: true });
   await sender.getByRole('button', { name: 'Switch color theme' }).click();
 
-  await sender.getByRole('button', { name: 'Transfer history', exact: true }).click();
   await sender.getByRole('button', { name: 'Received', exact: true }).click();
-  await sender.getByRole('heading', { name: 'No received files. Yet.' }).waitFor();
-  await sender.getByRole('button', { name: 'Overview', exact: true }).click();
+  await sender.getByText('No received files yet.', { exact: true }).waitFor();
+  await sender.getByRole('button', { name: 'All', exact: true }).click();
 
   await sender.setViewportSize({ width: 390, height: 844 });
   await sender.waitForTimeout(200);
@@ -41,16 +40,15 @@ try {
   if (artifactPath) await sender.screenshot({ path: `${artifactPath}/relay-mobile.png`, fullPage: true });
   await sender.setViewportSize({ width: 1440, height: 1000 });
 
-  await sender.getByText('Ready when you are', { exact: true }).waitFor({ timeout: 45000 });
+  await sender.getByText('Ready', { exact: true }).waitFor({ timeout: 45000 });
   const receiver = await context.newPage();
   await receiver.goto(baseUrl);
-  await receiver.getByText('Ready when you are', { exact: true }).waitFor({ timeout: 45000 });
+  await receiver.getByText('Ready', { exact: true }).waitFor({ timeout: 45000 });
   await receiver.getByRole('button', { name: 'Settings', exact: true }).click();
   await receiver.getByLabel('Device name', { exact: true }).fill('Living room tablet');
   await receiver.getByRole('button', { name: 'Save changes' }).click();
-  const code = (await receiver.locator('.code-copy').innerText()).replace(/\s/g, '');
+  const code = (await receiver.locator('#own-code').innerText()).replace(/\s/g, '');
   assert.match(code, /^[A-Z0-9]{6}$/);
-  await sender.getByRole('button', { name: 'Connect another device' }).click();
   await sender.getByLabel('Enter the other device’s code').fill(code);
   await sender.getByRole('button', { name: 'Connect', exact: true }).click();
   await sender.locator('.connected-label').waitFor({ timeout: 30000 });
@@ -64,7 +62,7 @@ try {
     { name: 'sample.bin', mimeType: 'application/octet-stream', buffer: binary },
     { name: 'empty.txt', mimeType: 'text/plain', buffer: Buffer.alloc(0) },
   ]);
-  await sender.getByRole('button', { name: 'Send 3 files' }).click();
+  await sender.getByRole('button', { name: 'Send 3 files to Living room tablet' }).click();
   await receiver.getByRole('button', { name: 'Accept files' }).waitFor();
   await receiver.getByRole('button', { name: 'Accept files' }).click();
   await receiver.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 3, undefined, { timeout: 45000 });
@@ -97,9 +95,9 @@ try {
   assert.equal(Buffer.compare(Buffer.concat(binaryChunks), binary), 0);
 
   await sender.locator('#file-input').setInputFiles({ name: 'declined.txt', mimeType: 'text/plain', buffer: Buffer.from('Not accepted.') });
-  await sender.getByRole('button', { name: 'Send 1 file', exact: true }).click();
+  await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).click();
   await receiver.getByRole('button', { name: 'No, thanks' }).click();
-  await sender.getByRole('button', { name: 'Send 1 file', exact: true }).waitFor();
+  await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).waitFor();
   assert.equal(await receiver.locator('.transfer-row').count(), 3);
   await receiver.getByRole('button', { name: 'Disconnect Studio laptop', exact: true }).click();
   await sender.waitForFunction(() => !document.querySelector('.connected-label'));
