@@ -4,11 +4,11 @@ Built with [Agent Duel](https://github.com/bottomless/agent-duel)
 
 Relay sends files directly between your devices. There is no account and no cloud storage.
 
-Open this site on two devices. Enter one device’s code on the other device. Drop files, then accept the transfer. Download each file on the receiving device.
+Open this site on two devices. Enter one device’s code on the other device. Press “Add files or folders”, or drop them in, then accept the transfer on the other device. In the Receive card, choose a save folder, or download the files from Transfers.
 
 ## Privacy
 
-WebRTC encrypts each transfer. A public PeerJS server only helps the devices find each other. It does not store your files. You confirm every incoming transfer. Keep both tabs open. Each transfer supports up to 2 GB, within available browser memory.
+WebRTC encrypts each transfer. A public PeerJS server only helps the devices find each other. It does not store your files. You confirm every incoming transfer. Keep both tabs open. There is no fixed total size limit. Files move one by one. Each file must fit in the free space on the receiving device, and Relay shows that space before you send. Chrome, Edge, and Opera on a computer can write received files straight into a folder that you choose. Other browsers, such as Safari and Firefox, do not let websites write into a folder. In those browsers, download the files one by one, or all together as a ZIP file that keeps the folders.
 
 ## Screen and background
 

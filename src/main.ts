@@ -1,18 +1,19 @@
 import Peer, { type DataConnection } from 'peerjs';
 import {
   createIcons, ArrowDown, ArrowUp, ArrowUpRight, Check, CheckCheck, ChevronDown, CircleHelp,
-  Copy, Download, File, FileImage, FileText, Laptop, Link, LoaderCircle, Moon, Pencil, Plus,
-  RefreshCw, Send, Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
+  Copy, Download, ExternalLink, File, FileArchive, FileImage, FileText, Files, FolderDown, FolderOpen, Inbox, Laptop, Link,
+  LoaderCircle, Moon, Pencil, Plus, RefreshCw, Send, Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
 } from 'lucide';
-import { createCode, createVisibleClock, devicePlatform, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils';
+import { availableSpaceBytes, createCode, createVisibleClock, devicePlatform, escapeHtml, fitsInAvailableSpace, formatBytes, isValidOffer, isValidRelativePath, joinRelativePath, MAX_BATCH_FILES, normalizeBinary, normalizeCode, uniquePath, withCopyNumber } from './utils';
+import { crc32Update, createZip } from './zip';
 import { createScreenKeeper, type WakeState } from './wake';
 import { createVideoKeeper } from './wake-media';
 import './style.css';
 
 const iconSet = {
   ArrowDown, ArrowUp, ArrowUpRight, Check, CheckCheck, ChevronDown, CircleHelp, Copy, Download,
-  File, FileImage, FileText, Laptop, Link, LoaderCircle, Moon, Pencil, Plus, RefreshCw, Send,
-  Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
+  ExternalLink, File, FileArchive, FileImage, FileText, Files, FolderDown, FolderOpen, Inbox, Laptop, Link, LoaderCircle,
+  Moon, Pencil, Plus, RefreshCw, Send, Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
 };
 const icon = (name: string, className = '') => `<i data-lucide="${name}" class="${className}" aria-hidden="true"></i>`;
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -24,7 +25,7 @@ let peer: Peer;
 let networkReady = false;
 let networkError = '';
 let theme = localStorage.getItem('relay-theme') || 'light';
-let selectedFiles: File[] = [];
+let selectedFiles: SelectedFile[] = [];
 let selectedPeer = '';
 let isSending = false;
 let historyFilter = 'all';
@@ -37,6 +38,9 @@ const transfers: Transfer[] = [];
 const receivers = new Map<string, Receiver>();
 const offers = new Map<string, Offer>();
 const acceptance = new Map<string, { peerId: string; resolve: (accepted: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
+let destinationFolder: FileSystemDirectoryHandle | undefined;
+let availableBytes: number | undefined;
+let zipBusy = false;
 let channel: BroadcastChannel | undefined;
 try { channel = new BroadcastChannel('relay-nearby-v1'); } catch { channel = undefined; }
 
@@ -84,6 +88,11 @@ interface FileInfo {
   name: string;
   size: number;
   mime: string;
+  path?: string;
+}
+interface SelectedFile {
+  file: File;
+  path: string;
 }
 interface Transfer {
   id: string;
@@ -95,7 +104,11 @@ interface Transfer {
   status: 'active' | 'complete' | 'failed';
   progress: number;
   time: number;
-  url?: string;
+  blob?: Blob;
+  handle?: FileSystemFileHandle;
+  savedName?: string;
+  inFolder?: boolean;
+  crc?: number;
 }
 interface Receiver {
   info: FileInfo;
@@ -104,6 +117,20 @@ interface Receiver {
   peerId: string;
   batchId: string;
   lastSeen: number;
+  batch: ReceiveBatch;
+  started: boolean;
+  writable?: FileSystemWritableFileStream;
+  discard?: () => Promise<void>;
+  crc: number;
+  writeChain: Promise<void>;
+  writeError?: Error;
+}
+interface ReceiveBatch {
+  id: string;
+  folder?: FileSystemDirectoryHandle;
+  used: Set<string>;
+  storeUsed: Set<string>;
+  store?: Promise<FileSystemDirectoryHandle | undefined>;
 }
 interface Offer {
   batchId: string;
@@ -117,6 +144,180 @@ type Message =
   | { type: 'accepted' | 'declined' | 'cancel'; batchId: string }
   | { type: 'chunk'; id: string; data: ArrayBuffer | ArrayBufferView }
   | { type: 'end' | 'complete' | 'failed'; id: string };
+
+async function refreshAvailableSpace() {
+  try {
+    availableBytes = availableSpaceBytes(await navigator.storage?.estimate?.());
+  } catch { availableBytes = undefined; }
+  return availableBytes;
+}
+
+type DisplayItem = { name: string; path: string; size: number };
+function selectedItems(): DisplayItem[] {
+  return selectedFiles.map(({ file, path }) => ({ name: file.name, path, size: file.size }));
+}
+function offerFiles(files: FileInfo[]): DisplayItem[] {
+  return files.map((file) => ({ name: file.name, path: file.path || file.name, size: file.size }));
+}
+function selectedFolders(items: DisplayItem[]): string[] {
+  const folders = new Set<string>();
+  for (const item of items) {
+    const slash = item.path.indexOf('/');
+    if (slash > 0) folders.add(item.path.slice(0, slash));
+  }
+  return Array.from(folders);
+}
+function itemsHtml(items: DisplayItem[], removable: boolean) {
+  const visible = items.slice(0, 100);
+  const hiddenCount = items.length - visible.length;
+  return `${visible.map((item, index) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(item.name))}</span><div>${fileNameHtml(item.path)}<span>${formatBytes(item.size)}</span></div>${removable ? `<button class="icon-button" data-action="remove-file" data-index="${index}" aria-label="Remove ${escapeHtml(item.path)}" ${isSending ? 'disabled' : ''}>${icon('x')}</button>` : ''}</div>`).join('')}${hiddenCount > 0 ? `<div class="file-row"><span class="file-icon">${icon('file')}</span><div><strong class="file-name"><span class="file-name-base">and ${hiddenCount} more file${hiddenCount > 1 ? 's' : ''}</span></strong><span>All files are in the list and are sent in order.</span></div></div>` : ''}`;
+}
+type FolderSupport = 'yes' | 'frame' | 'insecure' | 'browser';
+type DirectoryPicker = (options?: { id?: string; mode?: 'read' | 'readwrite' }) => Promise<FileSystemDirectoryHandle>;
+type PermissionHandle = FileSystemHandle & {
+  queryPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
+  requestPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
+};
+type IterableDirectory = FileSystemDirectoryHandle & { keys?: () => AsyncIterable<string> };
+const directoryPicker = () => (window as { showDirectoryPicker?: DirectoryPicker }).showDirectoryPicker;
+function inCrossOriginFrame(): boolean {
+  if (window.self === window.top) return false;
+  try { return !window.top?.location.href; } catch { return true; }
+}
+function folderSupport(): FolderSupport {
+  if (inCrossOriginFrame()) return 'frame';
+  if (typeof directoryPicker() === 'function') return 'yes';
+  if (!window.isSecureContext) return 'insecure';
+  return 'browser';
+}
+function folderSupportReason(support: FolderSupport): string {
+  if (support === 'frame') return 'Relay runs inside another page here, so the browser blocks folder access. Open Relay in its own tab to choose a folder.';
+  if (support === 'insecure') return 'The browser allows folder access only on secure pages. Open Relay over HTTPS or on localhost to choose a folder.';
+  return 'This browser does not let websites save into a folder. Chrome, Edge, and Opera on a computer can do this.';
+}
+
+async function chooseDestinationFolder(): Promise<FileSystemDirectoryHandle | undefined> {
+  const support = folderSupport();
+  const picker = directoryPicker();
+  if (support !== 'yes' || !picker) { toast(folderSupportReason(support), true); return undefined; }
+  try {
+    const handle = await picker({ id: 'relay-save', mode: 'readwrite' });
+    void refreshAvailableSpace();
+    return handle;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return undefined;
+    toast(error instanceof DOMException && error.name === 'SecurityError' ? folderSupportReason('frame') : 'Relay could not open that folder. Try another folder.', true);
+    return undefined;
+  }
+}
+
+async function hasFolderAccess(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  const permissions = handle as PermissionHandle;
+  try {
+    if (!permissions.queryPermission) return true;
+    if (await permissions.queryPermission({ mode: 'readwrite' }) === 'granted') return true;
+    return (await permissions.requestPermission?.({ mode: 'readwrite' })) === 'granted';
+  } catch { return false; }
+}
+
+function openSettings(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('relay', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('settings');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function saveSetting(key: string, value: unknown) {
+  try {
+    const db = await openSettings();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction('settings', 'readwrite');
+      if (value === undefined) transaction.objectStore('settings').delete(key);
+      else transaction.objectStore('settings').put(value, key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    db.close();
+  } catch { /* The folder choice lasts only for this visit. */ }
+}
+async function loadSetting<T>(key: string): Promise<T | undefined> {
+  try {
+    const db = await openSettings();
+    const value = await new Promise<T | undefined>((resolve, reject) => {
+      const request = db.transaction('settings', 'readonly').objectStore('settings').get(key);
+      request.onsuccess = () => resolve(request.result as T | undefined);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value;
+  } catch { return undefined; }
+}
+async function setDestinationFolder(handle: FileSystemDirectoryHandle | undefined) {
+  destinationFolder = handle;
+  await saveSetting('destination', handle);
+  render();
+}
+async function restoreDestinationFolder() {
+  if (folderSupport() !== 'yes') return;
+  const handle = await loadSetting<FileSystemDirectoryHandle>('destination');
+  if (handle && typeof handle.getFileHandle === 'function') { destinationFolder = handle; render(); }
+}
+
+const SESSION_LOCK = `relay-session-${sessionId}`;
+async function downloadsRoot(): Promise<FileSystemDirectoryHandle | undefined> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    return await root.getDirectoryHandle('relay-downloads', { create: true });
+  } catch { return undefined; }
+}
+async function sessionFolder(create: boolean): Promise<FileSystemDirectoryHandle | undefined> {
+  try { return await (await downloadsRoot())?.getDirectoryHandle(sessionId, { create }); } catch { return undefined; }
+}
+async function removeStaleDownloads() {
+  try {
+    if (!navigator.locks) return;
+    const root = (await downloadsRoot()) as IterableDirectory | undefined;
+    if (!root?.keys) return;
+    const held = new Set(((await navigator.locks.query()).held || []).map((lock) => lock.name));
+    const stale: string[] = [];
+    for await (const name of root.keys()) if (name !== sessionId && !held.has(`relay-session-${name}`)) stale.push(name);
+    for (const name of stale) await root.removeEntry(name, { recursive: true }).catch(() => undefined);
+  } catch { /* Old files stay until the next visit. */ }
+}
+async function clearSessionDownloads() {
+  try { await (await downloadsRoot())?.removeEntry(sessionId, { recursive: true }); } catch { /* Nothing to remove. */ }
+}
+
+async function entryExists(directory: FileSystemDirectoryHandle, name: string): Promise<boolean> {
+  try { await directory.getFileHandle(name); return true; } catch (error) {
+    return !(error instanceof DOMException && error.name === 'NotFoundError');
+  }
+}
+interface SaveTarget { directory: FileSystemDirectoryHandle; handle: FileSystemFileHandle; writable: FileSystemWritableFileStream; path: string; savedName: string }
+async function openSaveTarget(root: FileSystemDirectoryHandle, relativePath: string, used: Set<string>, avoidExisting: boolean): Promise<SaveTarget> {
+  const parts = relativePath.split('/');
+  const folders = parts.slice(0, -1);
+  let directory = root;
+  for (const part of folders) directory = await directory.getDirectoryHandle(part, { create: true });
+  const name = parts[parts.length - 1];
+  const prefix = folders.length ? `${folders.join('/')}/` : '';
+  let savedName = name;
+  for (let copy = 2; used.has(`${prefix}${savedName}`.toLocaleLowerCase()) || (avoidExisting && await entryExists(directory, savedName)); copy++) savedName = withCopyNumber(name, copy);
+  used.add(`${prefix}${savedName}`.toLocaleLowerCase());
+  const handle = await directory.getFileHandle(savedName, { create: true });
+  try {
+    const writable = await handle.createWritable();
+    return { directory, handle, writable, path: `${prefix}${savedName}`, savedName };
+  } catch (error) {
+    await directory.removeEntry(savedName).catch(() => undefined);
+    throw error;
+  }
+}
+
+function displayName(file: FileInfo): string {
+  return file.path || file.name;
+}
 
 const logo = `<svg viewBox="0 0 36 36" fill="none" aria-hidden="true"><rect width="36" height="36" rx="11" fill="currentColor"/><path d="M11 18h14M18 11v14M13 13l10 10M13 23l10-10" stroke="white" stroke-width="3.1" stroke-linecap="round"/></svg>`;
 
@@ -152,6 +353,10 @@ app.innerHTML = `
         </div>
       </section>
     </div>
+    <section class="card receive-card" aria-labelledby="receive-title">
+      <div class="card-heading"><h2 id="receive-title">Receive</h2><span id="receive-space" class="receive-space"></span></div>
+      <div id="receive-body"></div>
+    </section>
     <section class="card history-card" aria-labelledby="history-title">
       <div class="card-heading"><h2 id="history-title">Transfers <span id="history-count" class="count-badge" hidden></span></h2><div class="history-tools"><div class="filters" role="group" aria-label="Filter transfers"><button class="filter-button" data-action="filter" data-filter="all">All</button><button class="filter-button" data-action="filter" data-filter="sent">Sent</button><button class="filter-button" data-action="filter" data-filter="received">Received</button></div><button id="clear-history" class="text-button" data-action="clear-history">Clear</button></div></div>
       <div id="history"></div>
@@ -160,7 +365,12 @@ app.innerHTML = `
   </main>
   <dialog id="modal" aria-labelledby="dialog-title"><div id="modal-content"></div></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="add-menu" class="add-menu" role="menu" aria-label="Add to the transfer" hidden>
+    <button type="button" role="menuitem" data-action="pick-files">${icon('files')}<span><strong>Files</strong><small>Pick one or more files</small></span></button>
+    <button type="button" role="menuitem" data-action="pick-folder">${icon('folder-open')}<span><strong>Folder</strong><small>Pick a folder and everything in it</small></span></button>
+  </div>
   <input id="file-input" type="file" multiple hidden />
+  <input id="folder-input" type="file" multiple webkitdirectory hidden />
 `;
 const query = <T extends HTMLElement>(selector: string) => {
   const element = document.querySelector<T>(selector);
@@ -170,10 +380,13 @@ const query = <T extends HTMLElement>(selector: string) => {
 const modal = query<HTMLDialogElement>('#modal');
 const modalContent = query<HTMLDivElement>('#modal-content');
 const fileInput = query<HTMLInputElement>('#file-input');
+const folderInput = query<HTMLInputElement>('#folder-input');
 const dropzone = query<HTMLDivElement>('#dropzone');
 const sendFooter = query<HTMLDivElement>('#send-footer');
 const deviceList = query<HTMLDivElement>('#device-list');
 const historyList = query<HTMLDivElement>('#history');
+const receiveBody = query<HTMLDivElement>('#receive-body');
+const addMenu = query<HTMLDivElement>('#add-menu');
 const pairInput = query<HTMLInputElement>('#pair-code');
 
 function refreshIcons() {
@@ -185,6 +398,7 @@ function render() {
   query('#network-status').innerHTML = `<span class="status-dot ${networkReady ? '' : networkError ? 'error' : 'pending'}"></span><span>${networkReady ? 'Ready' : networkError ? 'Offline' : 'Connecting'}</span>`;
   query('#own-code').textContent = `${ownCode.slice(0, 3)} ${ownCode.slice(3)}`;
   renderSend();
+  renderReceive();
   renderDevices();
   renderHistory();
   renderWake();
@@ -231,27 +445,77 @@ function renderSend() {
   const hasFiles = selectedFiles.length > 0;
   dropzone.classList.toggle('has-files', hasFiles);
   if (hasFiles) {
-    dropzone.removeAttribute('role');
-    dropzone.removeAttribute('tabindex');
-    dropzone.removeAttribute('aria-label');
-    dropzone.removeAttribute('data-action');
+    for (const name of ['role', 'tabindex', 'aria-label', 'aria-haspopup', 'aria-expanded', 'data-action']) dropzone.removeAttribute(name);
   } else {
     dropzone.setAttribute('role', 'button');
     dropzone.setAttribute('tabindex', '0');
-    dropzone.setAttribute('aria-label', 'Choose files or drop files here');
-    dropzone.dataset.action = 'choose';
+    dropzone.setAttribute('aria-label', 'Add files or folders, or drop them here');
+    dropzone.setAttribute('aria-haspopup', 'menu');
+    dropzone.setAttribute('aria-expanded', String(menuTrigger === dropzone));
+    dropzone.dataset.action = 'add-menu';
   }
-  const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+  const totalSize = selectedFiles.reduce((sum, selection) => sum + selection.file.size, 0);
+  const folders = selectedFolders(selectedItems());
+  const summary = `${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''}${folders.length ? ` · ${folders.length} folder${folders.length > 1 ? 's' : ''}` : ''} · ${formatBytes(totalSize)}`;
   dropzone.innerHTML = hasFiles
-    ? `<div class="selected-header"><span>${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''} · ${formatBytes(totalSize)}</span><button class="text-button" data-action="choose" ${isSending ? 'disabled' : ''}>${icon('plus')}Add more</button></div><div class="selected-files">${selectedFiles.map((file, index) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div>${fileNameHtml(file.name)}<span>${formatBytes(file.size)}</span></div><button class="icon-button" data-action="remove-file" data-index="${index}" aria-label="Remove ${escapeHtml(file.name)}" ${isSending ? 'disabled' : ''}>${icon('x')}</button></div>`).join('')}</div>`
-    : `<div class="upload-symbol">${icon('arrow-up')}</div><p>Drop files here or <span class="browse-link">browse</span></p>`;
+    ? `<div class="selected-header"><span>${summary}</span><button class="text-button" data-action="add-menu" aria-haspopup="menu" aria-expanded="false" ${isSending ? 'disabled' : ''}>${icon('plus')}Add more${icon('chevron-down', 'menu-caret')}</button></div><div class="selected-files">${itemsHtml(selectedItems(), true)}</div>`
+    : `<div class="upload-symbol">${icon('arrow-up')}</div><p>Drop files or folders here or <span class="browse-link">browse</span></p><p class="dropzone-note">Files go one by one. Each file must fit in the free space on the receiving device.</p>`;
   const list = Array.from(devices.values());
   const destination = hasFiles && list.length > 1
     ? `<label class="destination" for="destination"><span>Send to</span><span class="select-wrap"><select id="destination">${list.map((device) => `<option value="${escapeHtml(device.id)}" ${selectedPeer === device.id ? 'selected' : ''}>${escapeHtml(device.name)}</option>`).join('')}</select>${icon('chevron-down')}</span></label>`
     : '';
-  const action = hasFiles ? (list.length ? 'send' : 'pair') : 'choose';
-  const label = isSending ? 'Sending' : hasFiles ? list.length ? `Send ${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''}${list.length === 1 ? ` to ${escapeHtml(list[0].name)}` : ''}` : 'Connect a device to send' : 'Choose files';
-  sendFooter.innerHTML = `${destination}<button class="primary-button send-button" data-action="${action}" ${isSending ? 'disabled' : ''}>${icon(isSending ? 'loader-circle' : action === 'send' ? 'send' : action === 'pair' ? 'link' : 'plus', isSending ? 'spin' : '')}${label}</button>`;
+  const action = hasFiles ? (list.length ? 'send' : 'pair') : 'add-menu';
+  const label = isSending ? 'Sending' : hasFiles ? list.length ? `Send ${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''}${list.length === 1 ? ` to ${escapeHtml(list[0].name)}` : ''}` : 'Connect a device to send' : 'Add files or folders';
+  const menuAttributes = action === 'add-menu' ? ' aria-haspopup="menu" aria-expanded="false"' : '';
+  sendFooter.innerHTML = `${destination}<button class="primary-button send-button" data-action="${action}"${menuAttributes} ${isSending ? 'disabled' : ''}>${icon(isSending ? 'loader-circle' : action === 'send' ? 'send' : action === 'pair' ? 'link' : 'plus', isSending ? 'spin' : '')}${label}</button>`;
+}
+
+function zipCandidates(): Transfer[] {
+  return transfers.filter((transfer) => transfer.direction === 'received' && transfer.status === 'complete' && !transfer.inFolder && (transfer.blob || transfer.handle) && transfer.crc !== undefined);
+}
+
+function renderReceive() {
+  query('#receive-space').textContent = availableBytes === undefined ? '' : `${formatBytes(availableBytes)} free on this device`;
+  const support = folderSupport();
+  const folder = support === 'yes' ? destinationFolder : undefined;
+  const ready = zipCandidates();
+  const target = folder
+    ? `<div class="receive-row"><span class="file-icon received">${icon('folder-down')}</span><div class="receive-text"><strong>Save into “${escapeHtml(folder.name)}”</strong><span>Relay writes each received file into this folder and keeps the folder structure. It never replaces a file that is already there.</span></div><div class="receive-actions"><button class="secondary-button small" data-action="choose-destination">${icon('folder-open')}Change folder</button><button class="icon-button" data-action="clear-destination" aria-label="Stop saving into ${escapeHtml(folder.name)}">${icon('x')}</button></div></div>`
+    : `<div class="receive-row"><span class="file-icon received">${icon('inbox')}</span><div class="receive-text"><strong>Keep in Relay until you download</strong><span>${support === 'yes' ? 'Received files wait in the Transfers list. Choose a folder to save them straight to disk instead.' : `${folderSupportReason(support)} Received files wait in the Transfers list. Download them one by one, or all together as a ZIP file that keeps the folders.`}</span></div><div class="receive-actions">${support === 'yes' ? `<button class="secondary-button small" data-action="choose-destination">${icon('folder-open')}Choose save folder</button>` : support === 'frame' ? `<a class="secondary-button small" href="${escapeHtml(window.location.href)}" target="_blank" rel="noopener noreferrer">${icon('external-link')}Open in a new tab</a>` : ''}</div></div>`;
+  const zip = ready.length
+    ? `<div class="receive-zip"><span>${ready.length} received file${ready.length > 1 ? 's' : ''} ready · ${formatBytes(ready.reduce((sum, transfer) => sum + transfer.size, 0))}</span><button class="secondary-button small" data-action="download-all" ${zipBusy ? 'disabled' : ''}>${icon(zipBusy ? 'loader-circle' : 'file-archive', zipBusy ? 'spin' : '')}Download all as ZIP</button></div>`
+    : '';
+  receiveBody.innerHTML = target + zip;
+}
+
+let menuTrigger: HTMLElement | undefined;
+function menuItems() {
+  return Array.from(addMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+}
+function openAddMenu(trigger: HTMLElement) {
+  if (isSending) { toast('Please wait for the current transfer.', true); return; }
+  menuTrigger = trigger;
+  trigger.setAttribute('aria-expanded', 'true');
+  addMenu.hidden = false;
+  const anchor = trigger === dropzone ? dropzone.querySelector<HTMLElement>('.upload-symbol') || dropzone : trigger;
+  const bounds = anchor.getBoundingClientRect();
+  const width = addMenu.offsetWidth;
+  const height = addMenu.offsetHeight;
+  const left = Math.min(Math.max(8, bounds.left + bounds.width / 2 - width / 2), window.innerWidth - width - 8);
+  const below = bounds.bottom + 6;
+  addMenu.style.left = `${left}px`;
+  addMenu.style.top = `${below + height > window.innerHeight - 8 ? Math.max(8, bounds.top - height - 6) : below}px`;
+  menuItems()[0]?.focus();
+}
+function closeAddMenu(restoreFocus = false) {
+  if (addMenu.hidden) return;
+  addMenu.hidden = true;
+  const trigger = menuTrigger;
+  menuTrigger = undefined;
+  if (trigger?.isConnected) {
+    trigger.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) trigger.focus();
+  }
 }
 
 function renderDevices() {
@@ -293,7 +557,7 @@ function renderHistory() {
   clear.hidden = !transfers.length;
   clear.disabled = transfers.some((transfer) => transfer.status === 'active');
   historyList.innerHTML = filtered.length
-    ? filtered.map((transfer) => `<div class="transfer-row"><span class="file-icon ${transfer.direction}">${icon(fileIcon(transfer.name))}</span><div class="transfer-file">${fileNameHtml(transfer.name)}<span>${formatBytes(transfer.size)} · ${transfer.direction === 'sent' ? 'Sent to' : 'Received from'} ${escapeHtml(transfer.device)} · ${new Date(transfer.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div><div class="transfer-status ${transfer.status}">${transfer.status === 'active' ? `<span>${Math.round(transfer.progress)}%</span><span class="progress-track"><span style="width:${transfer.progress}%"></span></span>` : `${icon(transfer.status === 'complete' ? 'check-check' : 'x')}<span>${transfer.status === 'complete' ? 'Complete' : 'Interrupted'}</span>`}</div>${transfer.url ? `<button class="icon-button" data-action="download" data-id="${transfer.id}" aria-label="Download ${escapeHtml(transfer.name)}">${icon('download')}</button>` : '<span class="row-spacer"></span>'}</div>`).join('')
+    ? filtered.map((transfer) => `<div class="transfer-row"><span class="file-icon ${transfer.direction}">${icon(fileIcon(transfer.name))}</span><div class="transfer-file">${fileNameHtml(transfer.name)}<span>${formatBytes(transfer.size)} · ${transfer.direction === 'sent' ? 'Sent to' : 'Received from'} ${escapeHtml(transfer.device)} · ${new Date(transfer.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div><div class="transfer-status ${transfer.status}">${transfer.status === 'active' ? `<span>${Math.round(transfer.progress)}%</span><span class="progress-track"><span style="width:${transfer.progress}%"></span></span>` : `${icon(transfer.status === 'complete' ? 'check-check' : 'x')}<span>${transfer.status === 'complete' ? 'Complete' : 'Interrupted'}</span>`}</div>${transfer.status === 'complete' && (transfer.blob || transfer.handle) ? `<button class="icon-button" data-action="download" data-id="${transfer.id}" aria-label="Download ${escapeHtml(transfer.name)}">${icon('download')}</button>` : '<span class="row-spacer"></span>'}</div>`).join('')
     : `<p class="empty">${historyFilter === 'all' ? 'No transfers yet.' : `No ${historyFilter} files yet.`}</p>`;
 }
 
@@ -316,7 +580,7 @@ function openModal(content: string) {
 }
 
 function helpModal() {
-  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Drop your files in, pick the device, and press Send.</p></li><li><h3>Accept and download</h3><p>Accept the transfer on the other device, then download each file.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Relay keeps your screen on while files move, so a phone does not lock in the middle of a transfer. Time in a background tab does not count against a transfer. Each transfer supports up to 2 GB, within available browser memory. If a direct route is unavailable, the transfer can use a network relay.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
+  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Press “Add files or folders”, or drop them in. Pick the device and press Send.</p></li><li><h3>Accept and save</h3><p>Accept the transfer on the other device. In Receive, choose a save folder, or download the files from Transfers.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Relay keeps your screen on while files move, so a phone does not lock in the middle of a transfer. Time in a background tab does not count against a transfer. There is no fixed total size limit. Files move one by one. Each file must fit in the free space on the receiving device. Relay shows that space and refuses a file that does not fit. Chrome, Edge, and Opera on a computer can save received files straight into a folder. Other browsers keep the files in Relay. Download them one by one, or all together as a ZIP file that keeps the folders. If a direct route is unavailable, the transfer can use a network relay.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
 }
 
 function settingsModal() {
@@ -345,10 +609,65 @@ async function copyText(value: string, message: string) {
   }
 }
 
-function addFiles(files: File[]) {
+function addFiles(incoming: SelectedFile[]) {
   if (isSending) { toast('Please wait for the current transfer.', true); return; }
+  let files = incoming;
+  if (selectedFiles.length + files.length > MAX_BATCH_FILES) {
+    files = files.slice(0, Math.max(0, MAX_BATCH_FILES - selectedFiles.length));
+    toast(`Relay can list up to ${MAX_BATCH_FILES} files at a time. The rest were not added.`, true);
+  }
   selectedFiles.push(...files);
+  void refreshAvailableSpace();
   render();
+}
+
+function filesFromList(files: FileList | File[]): SelectedFile[] {
+  return Array.from(files).map((file) => {
+    const withPath = file as File & { webkitRelativePath?: string };
+    const candidate = (withPath.webkitRelativePath || file.name).replace(/\\/g, '/');
+    const path = isValidRelativePath(candidate) ? candidate : file.name;
+    return { file, path };
+  });
+}
+
+async function filesFromDataTransfer(dataTransfer: DataTransfer | null): Promise<SelectedFile[]> {
+  if (!dataTransfer) return [];
+  const items = Array.from(dataTransfer.items || []);
+  const getEntry = (item: DataTransferItem) => (item as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntry | null }).webkitGetAsEntry?.() || null;
+  const selections: SelectedFile[] = [];
+  const seen = new Set<string>();
+  const keyOf = (path: string, file: File) => `${path}\0${file.size}\0${file.lastModified}`;
+  const push = (selection: SelectedFile) => {
+    const key = keyOf(selection.path, selection.file);
+    if (seen.has(key)) return;
+    seen.add(key);
+    selections.push(selection);
+  };
+  const walk = async (entry: FileSystemEntry, prefix: string): Promise<void> => {
+    if (entry.isFile) {
+      const fileEntry = entry as FileSystemFileEntry;
+      await new Promise<void>((resolve) => {
+        fileEntry.file((file) => { push({ file, path: joinRelativePath(prefix, file.name) }); resolve(); }, () => resolve());
+      });
+      return;
+    }
+    const reader = (entry as FileSystemDirectoryEntry).createReader();
+    for (;;) {
+      const entries = await new Promise<FileSystemEntry[]>((resolve) => reader.readEntries((value) => resolve(value), () => resolve([])));
+      if (!entries.length) break;
+      for (const child of entries) await walk(child, joinRelativePath(prefix, entry.name));
+    }
+  };
+  let walked = false;
+  for (const item of items) {
+    if (item.kind !== 'file') continue;
+    const entry = getEntry(item);
+    if (!entry) continue;
+    walked = true;
+    await walk(entry, '');
+  }
+  if (!walked) for (const selection of filesFromList(dataTransfer.files)) push(selection);
+  return selections;
 }
 
 function applyTheme() {
@@ -370,7 +689,13 @@ app.addEventListener('click', (event) => {
   if (!target || target.hasAttribute('disabled')) return;
   const action = target.dataset.action;
   if (target.tagName === 'A' && (target.getAttribute('href') || '').startsWith('#')) event.preventDefault();
-  if (action === 'choose') fileInput.click();
+  if (action !== 'add-menu') closeAddMenu();
+  if (action === 'add-menu') { if (menuTrigger === target) closeAddMenu(); else { closeAddMenu(); openAddMenu(target); } }
+  else if (action === 'pick-files') fileInput.click();
+  else if (action === 'pick-folder') folderInput.click();
+  else if (action === 'choose-destination') void pickDestination();
+  else if (action === 'clear-destination') { void setDestinationFolder(undefined); toast('Received files will wait in Relay until you download them.'); }
+  else if (action === 'download-all') void downloadAll();
   else if (action === 'remove-file') { selectedFiles.splice(Number(target.dataset.index), 1); render(); }
   else if (action === 'pair') focusPairing();
   else if (action === 'help') helpModal();
@@ -404,43 +729,110 @@ app.addEventListener('click', (event) => {
   else if (action === 'send') void sendFiles();
   else if (action === 'filter') { historyFilter = target.dataset.filter || 'all'; render(); }
   else if (action === 'clear-history') {
-    for (const transfer of transfers) if (transfer.url) URL.revokeObjectURL(transfer.url);
     transfers.splice(0);
+    if (!receivers.size) void clearSessionDownloads();
     render();
     toast('Transfer history cleared.');
   } else if (action === 'download') {
     const transfer = transfers.find((item) => item.id === target.dataset.id);
-    if (transfer?.url) {
-      const link = document.createElement('a');
-      link.href = transfer.url;
-      link.download = transfer.name;
-      link.click();
-    }
-  } else if (action === 'accept-offer' || action === 'decline-offer') respondToOffer(target.dataset.batch || '', action === 'accept-offer');
+    if (transfer) void downloadTransfer(transfer);
+  } else if (action === 'accept-offer' || action === 'decline-offer') void respondToOffer(target.dataset.batch || '', action === 'accept-offer');
 });
 
 app.addEventListener('keydown', (event) => {
   if (event.target === dropzone && (event.key === 'Enter' || event.key === ' ')) {
     event.preventDefault();
-    fileInput.click();
+    if (menuTrigger === dropzone) closeAddMenu(); else { closeAddMenu(); openAddMenu(dropzone); }
   }
 });
+document.addEventListener('keydown', (event) => {
+  if (addMenu.hidden) return;
+  const items = menuItems();
+  const index = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (event.key === 'Escape') { event.preventDefault(); closeAddMenu(true); }
+  else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    items[(index + step + items.length) % items.length]?.focus();
+  } else if (event.key === 'Tab') closeAddMenu();
+});
+document.addEventListener('pointerdown', (event) => {
+  if (addMenu.hidden) return;
+  const target = event.target as Node;
+  if (addMenu.contains(target) || menuTrigger?.contains(target)) return;
+  closeAddMenu();
+});
+window.addEventListener('resize', () => closeAddMenu());
+window.addEventListener('scroll', () => closeAddMenu(), true);
 
 app.addEventListener('change', (event) => {
   const input = event.target as HTMLInputElement;
   if (input.id === 'destination') selectedPeer = input.value;
 });
 fileInput.addEventListener('change', () => {
-  addFiles(Array.from(fileInput.files || []));
+  addFiles(filesFromList(fileInput.files || []));
   fileInput.value = '';
+});
+folderInput.addEventListener('change', () => {
+  addFiles(filesFromList(folderInput.files || []));
+  folderInput.value = '';
 });
 dropzone.addEventListener('dragover', (event) => { event.preventDefault(); dropzone.classList.add('dragover'); });
 dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
 dropzone.addEventListener('drop', (event) => {
   event.preventDefault();
   dropzone.classList.remove('dragover');
-  addFiles(Array.from(event.dataTransfer?.files || []));
+  void filesFromDataTransfer(event.dataTransfer).then((selections) => { if (selections.length) addFiles(selections); });
 });
+
+async function pickDestination() {
+  const handle = await chooseDestinationFolder();
+  if (!handle) return;
+  await setDestinationFolder(handle);
+  toast(`Received files will save into ${handle.name}.`);
+  const shown = modalContent.dataset.offer;
+  const offer = shown ? offers.get(shown) : undefined;
+  if (offer) showOffer(offer);
+}
+
+function saveBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function baseName(path: string) {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+async function downloadTransfer(transfer: Transfer) {
+  try {
+    if (transfer.blob) saveBlob(transfer.blob, baseName(transfer.name));
+    else if (transfer.handle) saveBlob(await transfer.handle.getFile(), transfer.savedName || baseName(transfer.name));
+  } catch { toast(transfer.inFolder ? 'Relay cannot read that file now. It is still in the folder you chose.' : 'Relay cannot read that file now. Ask the sender to send it again.', true); }
+}
+
+async function downloadAll() {
+  const ready = zipCandidates().reverse();
+  if (!ready.length || zipBusy) return;
+  zipBusy = true;
+  render();
+  try {
+    const used = new Set<string>();
+    const entries = [];
+    for (const transfer of ready) {
+      const data = transfer.blob || await transfer.handle?.getFile();
+      if (data) entries.push({ name: uniquePath(transfer.name, used), data, crc: transfer.crc ?? 0 });
+    }
+    saveBlob(createZip(entries), `relay-${new Date().toISOString().slice(0, 10)}.zip`);
+    toast(`The ZIP file has ${entries.length} file${entries.length > 1 ? 's' : ''}.`);
+  } catch { toast('Relay could not make the ZIP file. Download the files one by one instead.', true); }
+  finally { zipBusy = false; render(); }
+}
+
 query<HTMLFormElement>('#pair-form').addEventListener('submit', (event) => {
   event.preventDefault();
   connectTo(normalizeCode(pairInput.value));
@@ -453,7 +845,7 @@ modal.addEventListener('click', (event) => {
 });
 modal.addEventListener('close', () => {
   const shown = modalContent.dataset.offer;
-  if (shown && offers.has(shown)) respondToOffer(shown, false);
+  if (shown && offers.has(shown)) void respondToOffer(shown, false);
   delete modalContent.dataset.offer;
   const pending = Array.from(offers.values())[0];
   if (pending) setTimeout(() => { if (offers.has(pending.batchId)) showOffer(pending); }, 100);
@@ -565,6 +957,7 @@ function registerConnection(connection: DataConnection) {
     if (selectedPeer === connection.peer) selectedPeer = Array.from(devices.keys())[0] || '';
     for (const [id, receiver] of receivers) {
       if (receiver.peerId === connection.peer) {
+        discardReceiver(receiver);
         receivers.delete(id);
         const transfer = transfers.find((item) => item.id === id);
         if (transfer) transfer.status = 'failed';
@@ -588,11 +981,23 @@ function registerConnection(connection: DataConnection) {
 }
 
 function handleMessage(connection: DataConnection, message: Message) {
+  void handleMessageAsync(connection, message);
+}
+
+async function handleMessageAsync(connection: DataConnection, message: Message) {
+  try {
+    await handleMessageBody(connection, message);
+  } catch (error) {
+    console.error('Relay message handling failed:', error);
+  }
+}
+
+async function handleMessageBody(connection: DataConnection, message: Message) {
   const device = devices.get(connection.peer);
   if (!device || device.connection !== connection) return;
   if (message.type === 'offer') {
     if (!isValidOffer(message) || offers.has(message.batchId)) return;
-    if (offers.size >= 5 || receivers.size + message.files.length > 100 || message.files.some((file) => receivers.has(file.id) || transfers.some((transfer) => transfer.id === file.id))) {
+    if (receivers.size + message.files.length > MAX_BATCH_FILES || message.files.some((file) => receivers.has(file.id) || transfers.some((transfer) => transfer.id === file.id))) {
       connection.send({ type: 'declined', batchId: message.batchId });
       return;
     }
@@ -608,6 +1013,7 @@ function handleMessage(connection: DataConnection, message: Message) {
     if (offer?.device.id === connection.peer) offers.delete(message.batchId);
     for (const [id, receiver] of receivers) {
       if (receiver.peerId === connection.peer && receiver.batchId === message.batchId) {
+        discardReceiver(receiver);
         receivers.delete(id);
         const transfer = transfers.find((item) => item.id === id);
         if (transfer) transfer.status = 'failed';
@@ -619,15 +1025,22 @@ function handleMessage(connection: DataConnection, message: Message) {
     const receiver = receivers.get(message.id);
     if (!receiver || receiver.peerId !== connection.peer) return;
     const data = normalizeBinary(message.data);
-    if (!data?.byteLength || data.byteLength !== Math.min(64 * 1024, receiver.info.size - receiver.bytes)) {
+    if (!data?.byteLength || data.byteLength !== Math.min(64 * 1024, receiver.info.size - receiver.bytes) || receiver.writeError) {
       connection.send({ type: 'failed', id: message.id });
+      discardReceiver(receiver);
       receivers.delete(message.id);
       const transfer = transfers.find((item) => item.id === message.id);
       if (transfer) transfer.status = 'failed';
       render();
       return;
     }
-    receiver.chunks.push(data);
+    startReceiver(receiver);
+    const chunk = data;
+    receiver.crc = crc32Update(receiver.crc, new Uint8Array(chunk));
+    receiver.writeChain = receiver.writeChain.then(async () => {
+      if (receiver.writable) await receiver.writable.write(chunk);
+      else receiver.chunks.push(chunk);
+    }).catch((error: unknown) => { receiver.writeError = error instanceof Error ? error : new Error('Relay could not save the file.'); });
     receiver.bytes += data.byteLength;
     for (const item of receivers.values()) {
       if (item.peerId === connection.peer && item.batchId === receiver.batchId) item.lastSeen = Date.now();
@@ -639,12 +1052,24 @@ function handleMessage(connection: DataConnection, message: Message) {
     const transfer = transfers.find((item) => item.id === message.id);
     if (transfer) {
       if (receiver.bytes === receiver.info.size) {
-        const blob = new Blob(receiver.chunks, { type: receiver.info.mime || 'application/octet-stream' });
-        transfer.url = URL.createObjectURL(blob);
-        transfer.status = 'complete';
-        transfer.progress = 100;
-        connection.send({ type: 'complete', id: message.id });
-        toast(`${receiver.info.name} arrived. It is ready to download.`);
+        try {
+          startReceiver(receiver);
+          await receiver.writeChain;
+          if (receiver.writeError) throw receiver.writeError;
+          if (receiver.writable) await receiver.writable.close();
+          else transfer.blob = new Blob(receiver.chunks, { type: receiver.info.mime || 'application/octet-stream' });
+          receiver.chunks = [];
+          transfer.crc = receiver.crc;
+          transfer.status = 'complete';
+          transfer.progress = 100;
+          connection.send({ type: 'complete', id: message.id });
+          toast(transfer.inFolder ? `${baseName(transfer.name)} is saved in ${receiver.batch.folder?.name ?? 'your folder'}.` : `${baseName(transfer.name)} arrived.`);
+        } catch {
+          await receiver.discard?.().catch(() => undefined);
+          transfer.status = 'failed';
+          connection.send({ type: 'failed', id: message.id });
+          toast(`Relay could not save ${receiver.info.name}. Check the free space and try again.`, true);
+        }
       } else { transfer.status = 'failed'; connection.send({ type: 'failed', id: message.id }); }
     }
     receivers.delete(message.id);
@@ -658,22 +1083,84 @@ function handleMessage(connection: DataConnection, message: Message) {
 }
 
 function showOffer(offer: Offer) {
-  openModal(`<h2>${escapeHtml(offer.device.name)} wants to send you ${offer.files.length} file${offer.files.length > 1 ? 's' : ''}</h2><p>${formatBytes(offer.files.reduce((sum, file) => sum + file.size, 0))} in total. Only accept files from devices you trust.</p><div class="offer-files">${offer.files.map((file) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div>${fileNameHtml(file.name)}<span>${formatBytes(file.size)}</span></div></div>`).join('')}</div><div class="offer-actions"><button class="secondary-button" data-action="decline-offer" data-batch="${escapeHtml(offer.batchId)}">No, thanks</button><button class="primary-button" data-action="accept-offer" data-batch="${escapeHtml(offer.batchId)}">${icon('arrow-down')}Accept files</button></div>`);
+  const items = offerFiles(offer.files);
+  const folders = selectedFolders(items);
+  const total = offer.files.reduce((sum, file) => sum + file.size, 0);
+  const over: string[] = [];
+  if (availableBytes !== undefined) {
+    for (const file of offer.files) if (!fitsInAvailableSpace(file.size, availableBytes)) over.push(displayName(file));
+  }
+  const spaceNote = availableBytes === undefined
+    ? 'Relay cannot read the free space on this device, so the browser applies its own storage limit.'
+    : over.length
+      ? `This device has ${formatBytes(availableBytes)} free. ${over.length} file${over.length > 1 ? 's do' : ' does'} not fit and will fail. Accept only if that is fine.`
+      : `This device has ${formatBytes(availableBytes)} free. Each file fits. Files move one by one.`;
+  const support = folderSupport();
+  const folder = support === 'yes' ? destinationFolder : undefined;
+  const saveRow = `<div class="offer-save"><span class="file-icon received">${icon(folder ? 'folder-down' : 'inbox')}</span><div class="receive-text"><strong>${folder ? `Save into “${escapeHtml(folder.name)}”` : 'Keep in Relay until you download'}</strong><span>${folder ? 'Folders inside the transfer are kept.' : support === 'yes' ? 'You can choose a folder to save into.' : 'Download the files one by one, or all together as a ZIP file.'}</span></div>${support === 'yes' ? `<button class="secondary-button small" data-action="choose-destination">${icon('folder-open')}${folder ? 'Change' : 'Choose folder'}</button>` : ''}</div>`;
+  openModal(`<h2>${escapeHtml(offer.device.name)} wants to send you ${offer.files.length} file${offer.files.length > 1 ? 's' : ''}</h2><p>${formatBytes(total)} in total${folders.length ? ` · ${folders.length} folder${folders.length > 1 ? 's' : ''}` : ''}. Only accept files from devices you trust.</p><div class="offer-files">${itemsHtml(items, false)}</div>${saveRow}<p class="help-detail">${spaceNote}</p><div class="offer-actions"><button class="secondary-button" data-action="decline-offer" data-batch="${escapeHtml(offer.batchId)}">No, thanks</button><button class="primary-button" data-action="accept-offer" data-batch="${escapeHtml(offer.batchId)}">${icon('arrow-down')}Accept files</button></div>`);
   modalContent.dataset.offer = offer.batchId;
 }
 
-function respondToOffer(batchId: string, accepted: boolean) {
+function discardReceiver(receiver: Receiver) {
+  const discard = receiver.discard;
+  receiver.chunks = [];
+  if (discard) void receiver.writeChain.then(discard).catch(() => undefined);
+}
+
+function startReceiver(receiver: Receiver) {
+  if (receiver.started) return;
+  receiver.started = true;
+  receiver.writeChain = receiver.writeChain.then(() => openReceiverTarget(receiver));
+}
+
+async function openReceiverTarget(receiver: Receiver) {
+  const transfer = transfers.find((item) => item.id === receiver.info.id);
+  const path = displayName(receiver.info);
+  const batch = receiver.batch;
+  const attach = (target: SaveTarget, inFolder: boolean) => {
+    receiver.writable = target.writable;
+    receiver.discard = async () => {
+      await target.writable.abort().catch(() => undefined);
+      await target.directory.removeEntry(target.savedName).catch(() => undefined);
+    };
+    if (transfer) {
+      transfer.handle = target.handle;
+      transfer.savedName = target.savedName;
+      transfer.name = target.path;
+      transfer.inFolder = inFolder;
+    }
+  };
+  if (batch.folder) {
+    try { attach(await openSaveTarget(batch.folder, path, batch.used, true), true); return; } catch { /* Use browser storage instead. */ }
+  }
+  batch.store ??= sessionFolder(true).then((folder) => folder?.getDirectoryHandle(batch.id, { create: true })).catch(() => undefined);
+  const store = await batch.store;
+  if (store) {
+    try { attach(await openSaveTarget(store, path, batch.storeUsed, false), false); return; } catch { /* Keep the file in memory instead. */ }
+  }
+  if (transfer) transfer.name = uniquePath(path, batch.used);
+}
+
+async function respondToOffer(batchId: string, accepted: boolean) {
   const offer = offers.get(batchId);
   if (!offer) return;
   offers.delete(batchId);
   if (accepted) {
-    for (const file of offer.files) {
-      receivers.set(file.id, { info: file, chunks: [], bytes: 0, peerId: offer.device.id, batchId, lastSeen: Date.now() });
-      transfers.unshift({ id: file.id, name: file.name, size: file.size, device: offer.device.name, peerId: offer.device.id, direction: 'received', status: 'active', progress: 0, time: Date.now() });
+    let folder = folderSupport() === 'yes' ? destinationFolder : undefined;
+    if (folder && !await hasFolderAccess(folder)) {
+      toast(`Relay cannot write into ${folder.name}. The files will wait in Relay instead.`, true);
+      folder = undefined;
     }
-    offer.device.connection.send({ type: 'accepted', batchId });
-  } else offer.device.connection.send({ type: 'declined', batchId });
-  modal.close();
+    const batch: ReceiveBatch = { id: batchId, folder, used: new Set(), storeUsed: new Set() };
+    for (const file of [...offer.files].reverse()) {
+      receivers.set(file.id, { info: file, chunks: [], bytes: 0, peerId: offer.device.id, batchId, lastSeen: Date.now(), batch, started: false, crc: 0, writeChain: Promise.resolve() });
+      transfers.unshift({ id: file.id, name: displayName(file), size: file.size, device: offer.device.name, peerId: offer.device.id, direction: 'received', status: 'active', progress: 0, time: Date.now() });
+    }
+    if (offer.device.connection.open) offer.device.connection.send({ type: 'accepted', batchId });
+    void refreshAvailableSpace();
+  } else if (offer.device.connection.open) offer.device.connection.send({ type: 'declined', batchId });
+  if (modalContent.dataset.offer === batchId) modal.close();
   render();
 }
 
@@ -745,12 +1232,17 @@ function updateProgress(id: string, progress: number) {
 async function sendFiles() {
   const device = devices.get(selectedPeer || Array.from(devices.keys())[0]);
   if (!device || !device.connection.open || !selectedFiles.length || isSending) return;
-  if (selectedFiles.length > 100) { toast('Please share up to 100 files at a time.', true); return; }
-  if (selectedFiles.reduce((sum, file) => sum + file.size, 0) > 2 ** 31) { toast('Please keep each transfer under 2 GB to protect browser memory.', true); return; }
+  if (selectedFiles.length > MAX_BATCH_FILES) { toast(`Please share up to ${MAX_BATCH_FILES} files at a time.`, true); return; }
   isSending = true;
   const files = [...selectedFiles];
   const batchId = crypto.randomUUID();
-  const fileInfos = files.map((file) => ({ id: crypto.randomUUID(), name: file.name, size: file.size, mime: file.type }));
+  const fileInfos: FileInfo[] = files.map((selection) => {
+    const slash = selection.path.lastIndexOf('/');
+    const baseName = slash >= 0 ? selection.path.slice(slash + 1) : selection.file.name;
+    const info: FileInfo = { id: crypto.randomUUID(), name: baseName, size: selection.file.size, mime: selection.file.type };
+    if (selection.path !== baseName) info.path = selection.path;
+    return info;
+  });
   prepareFlowControl(device.connection);
   render();
   toast(`Waiting for ${device.name} to accept.`);
@@ -766,9 +1258,10 @@ async function sendFiles() {
       return;
     }
     for (let index = 0; index < files.length; index++) {
-      const file = files[index];
+      const selection = files[index];
+      const file = selection.file;
       const info = fileInfos[index];
-      transfers.unshift({ id: info.id, name: info.name, size: info.size, device: device.name, peerId: device.id, direction: 'sent', status: 'active', progress: 0, time: Date.now() });
+      transfers.unshift({ id: info.id, name: selection.path, size: info.size, device: device.name, peerId: device.id, direction: 'sent', status: 'active', progress: 0, time: Date.now() });
       render();
       for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
         if (!device.connection.open) throw new Error('The device disconnected.');
@@ -780,17 +1273,17 @@ async function sendFiles() {
       }
       const acknowledged = waitForAcknowledgement(info.id, device.connection);
       device.connection.send({ type: 'end', id: info.id });
-      if (await acknowledged !== 'complete') throw new Error('The transfer did not complete.');
+      if (await acknowledged !== 'complete') throw new Error(`The transfer of ${selection.path} did not complete.`);
     }
     selectedFiles = [];
     toast('All files arrived.');
-  } catch {
+  } catch (error) {
     if (device.connection.open) device.connection.send({ type: 'cancel', batchId });
     for (const info of fileInfos) {
       const transfer = transfers.find((item) => item.id === info.id);
       if (transfer?.status === 'active') transfer.status = 'failed';
     }
-    toast('The transfer stopped. Your files are still selected, so press Send to try again.', true);
+    toast(error instanceof Error && error.message.startsWith('The transfer of ') ? `${error.message} Your files are still selected, so press Send to try again.` : 'The transfer stopped. Your files are still selected, so press Send to try again.', true);
   } finally {
     isSending = false;
     for (const info of fileInfos) acknowledgements.delete(info.id);
@@ -829,6 +1322,7 @@ function sweepTimeouts() {
     if (Date.now() - receiver.lastSeen > RECEIVER_LIMIT) {
       const transfer = transfers.find((item) => item.id === id);
       if (transfer) transfer.status = 'failed';
+      discardReceiver(receiver);
       receivers.delete(id);
       changed = true;
     }
@@ -849,3 +1343,9 @@ window.addEventListener('beforeunload', () => channel?.postMessage({ type: 'good
 applyTheme();
 render();
 initializePeer();
+void refreshAvailableSpace().then(() => render());
+void restoreDestinationFolder();
+if (navigator.locks) {
+  void navigator.locks.request(SESSION_LOCK, () => new Promise<void>(() => undefined));
+  void navigator.locks.query().then(() => removeStaleDownloads());
+}

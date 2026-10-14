@@ -90,6 +90,14 @@ h1 { margin-bottom: 24px; font-size: 24px; font-weight: 700; letter-spacing: -.5
 .upload-symbol { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-bottom: 12px; border-radius: 12px; background: var(--accent-soft); color: var(--accent); }
 .upload-symbol > svg { width: 22px; height: 22px; }
 .dropzone > p { font-size: 14px; color: var(--muted); }
+.dropzone > p.dropzone-note { max-width: 420px; margin-top: 8px; font-size: 12px; color: var(--faint); }
+.menu-caret { width: 13px !important; height: 13px !important; margin-left: -1px; }
+.add-menu { position: fixed; z-index: 60; display: flex; flex-direction: column; gap: 2px; width: 248px; padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); box-shadow: 0 12px 32px #00000026; }
+.add-menu button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 9px 10px; border-radius: 7px; text-align: left; color: var(--text); }
+.add-menu button:hover, .add-menu button:focus-visible { background: var(--accent-soft); outline: none; }
+.add-menu button > svg { width: 18px; height: 18px; color: var(--accent); }
+.add-menu strong { display: block; font-size: 14px; font-weight: 600; }
+.add-menu small { display: block; font-size: 12px; color: var(--faint); }
 .browse-link { color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
 .selected-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding-bottom: 8px; font-size: 13px; font-weight: 500; color: var(--muted); }
 .selected-files { display: flex; flex-direction: column; min-width: 0; max-width: 100%; max-height: 220px; overflow-x: hidden; overflow-y: auto; }
@@ -135,6 +143,18 @@ input::placeholder { color: var(--faint); }
 .form-status { min-height: 20px; margin-top: 8px; font-size: 13px; color: var(--muted); }
 .form-status.error { color: var(--bad); }
 
+.receive-card { margin-bottom: 20px; }
+.receive-space { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.receive-row, .offer-save { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.receive-text { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
+.receive-text strong { overflow-wrap: anywhere; font-size: 14px; font-weight: 600; }
+.receive-text span { font-size: 13px; color: var(--muted); }
+.receive-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.receive-actions:empty { display: none; }
+.receive-zip { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted); }
+.offer-save { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
+.offer-save .receive-text span { font-size: 12px; }
+.offer-save > button { flex-shrink: 0; }
 .history-tools { display: flex; align-items: center; gap: 14px; }
 .filters { display: inline-flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--field); border: 1px solid var(--border); }
 .filter-button { padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 500; color: var(--muted); }
@@ -200,6 +220,8 @@ dialog h2 + p { margin-top: 8px; font-size: 14px; color: var(--muted); }
   .transfer-row { grid-template-columns: 34px minmax(0, 1fr) 36px; }
   .transfer-status { grid-column: 2; font-size: 12px; }
   .own-code > .text-button { margin-left: 0; }
+  .receive-row { flex-wrap: wrap; }
+  .receive-actions { width: 100%; padding-left: 46px; }
   dialog { padding: 22px; }
 }
 @media (prefers-reduced-motion: reduce) {

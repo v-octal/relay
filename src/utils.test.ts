@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createCode, createVisibleClock, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils.ts';
+import { availableSpaceBytes, createCode, createVisibleClock, escapeHtml, fitsInAvailableSpace, formatBytes, isValidOffer, isValidRelativePath, joinRelativePath, normalizeBinary, normalizeCode, uniquePath, withCopyNumber } from './utils.ts';
 
 test('file sizes use readable binary units', () => {
   assert.equal(formatBytes(0), '0 B');
@@ -79,16 +79,73 @@ test('offers reject duplicate files and unsafe sizes', () => {
   assert.equal(isValidOffer(value), false);
   value.files[0].size = 1.5;
   assert.equal(isValidOffer(value), false);
-  value.files[0].size = 2 ** 31 + 1;
+  value.files[0].size = 2 ** 53;
   assert.equal(isValidOffer(value), false);
   value.files[0].size = Number.NaN;
   assert.equal(isValidOffer(value), false);
 });
 
+test('offers have no fixed total limit, only per-file validity', () => {
+  const value = offer();
+  // Many files and one file well above the old 2 GB total are allowed by
+  // validation; free device space is checked separately at send/receive time.
+  const many = Array.from({ length: 500 }, () => ({ ...value.files[0], id: crypto.randomUUID(), size: 5 * 1024 ** 3 }));
+  assert.equal(isValidOffer({ ...value, files: many }), true);
+  value.files[0].size = 10 * 1024 ** 3;
+  assert.equal(isValidOffer(value), true);
+});
+
+test('offer paths must be safe relative paths', () => {
+  const value = offer();
+  (value.files[0] as { path?: string }).path = 'trip/day 1/photo.jpg';
+  assert.equal(isValidOffer(value), true);
+  value.files[0].name = 'trip/photo.jpg';
+  assert.equal(isValidOffer(value), false);
+  value.files[0].name = 'photo.jpg';
+  (value.files[0] as { path?: string }).path = '../escape.txt';
+  assert.equal(isValidOffer(value), false);
+  (value.files[0] as { path?: string }).path = '/absolute.txt';
+  assert.equal(isValidOffer(value), false);
+  (value.files[0] as { path?: string }).path = 'a\\b.txt';
+  assert.equal(isValidOffer(value), false);
+  (value.files[0] as { path?: string }).path = 'a//b.txt';
+  assert.equal(isValidOffer(value), false);
+  assert.equal(isValidRelativePath('archive'), true);
+  assert.equal(joinRelativePath('trip/day 1', 'photo.jpg'), 'trip/day 1/photo.jpg');
+  assert.equal(joinRelativePath('', 'photo.jpg'), 'photo.jpg');
+});
+
+test('repeated names get a copy number before the extension', () => {
+  assert.equal(withCopyNumber('photo.jpg', 2), 'photo (2).jpg');
+  assert.equal(withCopyNumber('README', 3), 'README (3)');
+  assert.equal(withCopyNumber('.env', 2), '.env (2)');
+  const used = new Set<string>();
+  assert.equal(uniquePath('trip/photo.jpg', used), 'trip/photo.jpg');
+  assert.equal(uniquePath('trip/Photo.JPG', used), 'trip/Photo (2).JPG');
+  assert.equal(uniquePath('trip/photo.jpg', used), 'trip/photo (3).jpg');
+  assert.equal(uniquePath('other/photo.jpg', used), 'other/photo.jpg');
+  assert.equal(uniquePath('photo.jpg', used), 'photo.jpg');
+});
+
+test('available space comes from the storage estimate', () => {
+  assert.equal(availableSpaceBytes({ quota: 1000, usage: 250 }), 750);
+  assert.equal(availableSpaceBytes({ quota: 1000 }), 1000);
+  assert.equal(availableSpaceBytes({ quota: 100, usage: 250 }), 0);
+  assert.equal(availableSpaceBytes({}), undefined);
+  assert.equal(availableSpaceBytes(undefined), undefined);
+  assert.equal(availableSpaceBytes({ quota: 'lots' }), undefined);
+  assert.equal(fitsInAvailableSpace(750, 750), true);
+  assert.equal(fitsInAvailableSpace(751, 750), false);
+  assert.equal(fitsInAvailableSpace(10 * 1024 ** 3, undefined), true);
+});
+
 test('offers have bounded file counts and file metadata', () => {
   const value = offer();
-  value.files = Array.from({ length: 101 }, () => ({ ...value.files[0], id: crypto.randomUUID() }));
+  value.files = Array.from({ length: 10001 }, () => ({ ...value.files[0], id: crypto.randomUUID() }));
   assert.equal(isValidOffer(value), false);
+  // A count far above the old 100-file cap stays valid.
+  value.files = Array.from({ length: 101 }, () => ({ ...value.files[0], id: crypto.randomUUID() }));
+  assert.equal(isValidOffer(value), true);
   value.files = [];
   assert.equal(isValidOffer(value), false);
   const invalidName = offer();
