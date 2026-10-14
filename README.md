@@ -4,7 +4,7 @@ Built with [Agent Duel](https://github.com/bottomless/agent-duel)
 
 Relay sends files directly between your devices. There is no account and no cloud storage.
 
-Open this site on two devices. Enter one device’s code on the other device. Press “Add files or folders”, or drop them in, then accept the transfer on the other device. In the Receive card, choose a save folder, or download the files from Transfers.
+Put both devices on the same network, such as the same Wi‑Fi. Open this site on both devices. Enter one device’s code on the other device. Press “Add files or folders”, or drop them in, then accept the transfer on the other device. In the Receive card, choose a save folder, or download the files from Transfers.
 
 ## Privacy
 

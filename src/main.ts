@@ -580,7 +580,7 @@ function openModal(content: string) {
 }
 
 function helpModal() {
-  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Press “Add files or folders”, or drop them in. Pick the device and press Send.</p></li><li><h3>Accept and save</h3><p>Accept the transfer on the other device. In Receive, choose a save folder, or download the files from Transfers.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Relay keeps your screen on while files move, so a phone does not lock in the middle of a transfer. Time in a background tab does not count against a transfer. There is no fixed total size limit. Files move one by one. Each file must fit in the free space on the receiving device. Relay shows that space and refuses a file that does not fit. Chrome, Edge, and Opera on a computer can save received files straight into a folder. Other browsers keep the files in Relay. Download them one by one, or all together as a ZIP file that keeps the folders. If a direct route is unavailable, the transfer can use a network relay.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
+  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Put both devices on the same network, such as the same Wi‑Fi. Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Press “Add files or folders”, or drop them in. Pick the device and press Send.</p></li><li><h3>Accept and save</h3><p>Accept the transfer on the other device. In Receive, choose a save folder, or download the files from Transfers.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Relay keeps your screen on while files move, so a phone does not lock in the middle of a transfer. Time in a background tab does not count against a transfer. There is no fixed total size limit. Files move one by one. Each file must fit in the free space on the receiving device. Relay shows that space and refuses a file that does not fit. Chrome, Edge, and Opera on a computer can save received files straight into a folder. Other browsers keep the files in Relay. Download them one by one, or all together as a ZIP file that keeps the folders.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
 }
 
 function settingsModal() {
@@ -881,13 +881,13 @@ function initializePeer() {
       return;
     }
     if (error.type === 'peer-unavailable') {
-      pairStatus('That device is not available. Check the code and keep Relay open on both devices.', true);
+      pairStatus('That device is not available. Make sure that both devices are on the same network. Check the code and keep Relay open on both devices.', true);
       pendingPair = '';
-      toast('Device not found. Check the connection code.', true);
+      toast('Device not found. Check the code and make sure that both devices are on the same network.', true);
     } else {
       networkError = 'Connection unavailable';
       networkReady = Boolean(peer.id && !peer.disconnected && !peer.destroyed);
-      pairStatus('Could not connect. Check your network and try again.', true);
+      pairStatus('Could not connect. Make sure that both devices are on the same network, then try again.', true);
       render();
     }
   });
@@ -908,8 +908,8 @@ function connectTo(code: string) {
     if (pendingPair === id && !devices.has(id)) {
       pendingPair = '';
       connection.close();
-      pairStatus('The connection took too long. Keep both tabs open and try again.', true);
-      toast('Could not reach the other device. Try again.', true);
+      pairStatus('The connection took too long. Make sure that both devices are on the same network and both tabs are open, then try again.', true);
+      toast('Could not reach the other device. Make sure that both devices are on the same network.', true);
     }
   }, 15000);
 }
@@ -977,7 +977,7 @@ function registerConnection(connection: DataConnection) {
     render();
     toast(`${device.name} disconnected.`, true);
   });
-  connection.on('error', () => { pairStatus('The connection failed. Please try again.', true); toast('Connection interrupted. Please try again.', true); });
+  connection.on('error', () => { pairStatus('The connection failed. Make sure that both devices are on the same network, then try again.', true); toast('Connection interrupted. Please try again.', true); });
 }
 
 function handleMessage(connection: DataConnection, message: Message) {

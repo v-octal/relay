@@ -24,6 +24,7 @@ try {
 
   await sender.getByRole('button', { name: 'How it works' }).click();
   await sender.getByRole('heading', { name: 'How it works' }).waitFor();
+  await sender.getByText('Put both devices on the same network', { exact: false }).waitFor();
   await sender.getByRole('button', { name: 'Got it' }).click();
   await sender.getByRole('button', { name: 'Settings', exact: true }).click();
   await sender.getByLabel('Device name', { exact: true }).fill('Studio laptop');
