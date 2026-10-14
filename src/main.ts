@@ -156,7 +156,7 @@ app.innerHTML = `
       <div class="card-heading"><h2 id="history-title">Transfers <span id="history-count" class="count-badge" hidden></span></h2><div class="history-tools"><div class="filters" role="group" aria-label="Filter transfers"><button class="filter-button" data-action="filter" data-filter="all">All</button><button class="filter-button" data-action="filter" data-filter="sent">Sent</button><button class="filter-button" data-action="filter" data-filter="received">Received</button></div><button id="clear-history" class="text-button" data-action="clear-history">Clear</button></div></div>
       <div id="history"></div>
     </section>
-    <footer class="site-footer"><p>${icon('shield-check')}Files go directly between devices and are never stored on a server.</p><p>Built with <a href="https://github.com/bottomless/agent-duel" target="_blank" rel="noopener noreferrer">https://github.com/bottomless/agent-duel</a></p></footer>
+    <footer class="site-footer"><p>${icon('shield-check')}Files go directly between devices and are never stored on a server.</p><p>Built with <a href="https://github.com/bottomless/agent-duel" target="_blank" rel="noopener noreferrer">Agent Duel</a></p></footer>
   </main>
   <dialog id="modal" aria-labelledby="dialog-title"><div id="modal-content"></div></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

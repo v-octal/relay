@@ -1,5 +1,7 @@
 # Relay
 
+Built with [Agent Duel](https://github.com/bottomless/agent-duel)
+
 Relay sends files directly between your devices. There is no account and no cloud storage.
 
 Open this site on two devices. Enter one device’s code on the other device. Drop files, then accept the transfer. Download each file on the receiving device.
@@ -32,5 +34,3 @@ npm run dev
 | `npm run test:e2e` | Run the browser test |
 
 The production build is a static site. GitHub Pages can host it.
-
-Built with https://github.com/bottomless/agent-duel
