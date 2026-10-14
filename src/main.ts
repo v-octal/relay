@@ -243,7 +243,7 @@ function renderSend() {
   }
   const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
   dropzone.innerHTML = hasFiles
-    ? `<div class="selected-header"><span>${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''} · ${formatBytes(totalSize)}</span><button class="text-button" data-action="choose" ${isSending ? 'disabled' : ''}>${icon('plus')}Add more</button></div><div class="selected-files">${selectedFiles.map((file, index) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div><strong>${escapeHtml(file.name)}</strong><span>${formatBytes(file.size)}</span></div><button class="icon-button" data-action="remove-file" data-index="${index}" aria-label="Remove ${escapeHtml(file.name)}" ${isSending ? 'disabled' : ''}>${icon('x')}</button></div>`).join('')}</div>`
+    ? `<div class="selected-header"><span>${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''} · ${formatBytes(totalSize)}</span><button class="text-button" data-action="choose" ${isSending ? 'disabled' : ''}>${icon('plus')}Add more</button></div><div class="selected-files">${selectedFiles.map((file, index) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div>${fileNameHtml(file.name)}<span>${formatBytes(file.size)}</span></div><button class="icon-button" data-action="remove-file" data-index="${index}" aria-label="Remove ${escapeHtml(file.name)}" ${isSending ? 'disabled' : ''}>${icon('x')}</button></div>`).join('')}</div>`
     : `<div class="upload-symbol">${icon('arrow-up')}</div><p>Drop files here or <span class="browse-link">browse</span></p>`;
   const list = Array.from(devices.values());
   const destination = hasFiles && list.length > 1
@@ -270,6 +270,15 @@ function fileIcon(name: string) {
   return /\.(png|jpe?g|gif|webp|svg|heic)$/i.test(name) ? 'file-image' : /\.(txt|pdf|docx?|md)$/i.test(name) ? 'file-text' : 'file';
 }
 
+function fileNameHtml(name: string) {
+  const dot = name.lastIndexOf('.');
+  const extLength = name.length - dot;
+  const split = dot > 0 && extLength > 1 && extLength <= 12;
+  const base = split ? name.slice(0, dot) : name;
+  const ext = split ? name.slice(dot) : '';
+  return `<strong class="file-name" title="${escapeHtml(name)}"><span class="file-name-base">${escapeHtml(base)}</span>${ext ? `<span class="file-name-ext">${escapeHtml(ext)}</span>` : ''}</strong>`;
+}
+
 function renderHistory() {
   const filtered = transfers.filter((transfer) => historyFilter === 'all' || transfer.direction === historyFilter);
   for (const button of document.querySelectorAll<HTMLButtonElement>('.filter-button')) {
@@ -284,7 +293,7 @@ function renderHistory() {
   clear.hidden = !transfers.length;
   clear.disabled = transfers.some((transfer) => transfer.status === 'active');
   historyList.innerHTML = filtered.length
-    ? filtered.map((transfer) => `<div class="transfer-row"><span class="file-icon ${transfer.direction}">${icon(fileIcon(transfer.name))}</span><div class="transfer-file"><strong>${escapeHtml(transfer.name)}</strong><span>${formatBytes(transfer.size)} · ${transfer.direction === 'sent' ? 'Sent to' : 'Received from'} ${escapeHtml(transfer.device)} · ${new Date(transfer.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div><div class="transfer-status ${transfer.status}">${transfer.status === 'active' ? `<span>${Math.round(transfer.progress)}%</span><span class="progress-track"><span style="width:${transfer.progress}%"></span></span>` : `${icon(transfer.status === 'complete' ? 'check-check' : 'x')}<span>${transfer.status === 'complete' ? 'Complete' : 'Interrupted'}</span>`}</div>${transfer.url ? `<button class="icon-button" data-action="download" data-id="${transfer.id}" aria-label="Download ${escapeHtml(transfer.name)}">${icon('download')}</button>` : '<span class="row-spacer"></span>'}</div>`).join('')
+    ? filtered.map((transfer) => `<div class="transfer-row"><span class="file-icon ${transfer.direction}">${icon(fileIcon(transfer.name))}</span><div class="transfer-file">${fileNameHtml(transfer.name)}<span>${formatBytes(transfer.size)} · ${transfer.direction === 'sent' ? 'Sent to' : 'Received from'} ${escapeHtml(transfer.device)} · ${new Date(transfer.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span></div><div class="transfer-status ${transfer.status}">${transfer.status === 'active' ? `<span>${Math.round(transfer.progress)}%</span><span class="progress-track"><span style="width:${transfer.progress}%"></span></span>` : `${icon(transfer.status === 'complete' ? 'check-check' : 'x')}<span>${transfer.status === 'complete' ? 'Complete' : 'Interrupted'}</span>`}</div>${transfer.url ? `<button class="icon-button" data-action="download" data-id="${transfer.id}" aria-label="Download ${escapeHtml(transfer.name)}">${icon('download')}</button>` : '<span class="row-spacer"></span>'}</div>`).join('')
     : `<p class="empty">${historyFilter === 'all' ? 'No transfers yet.' : `No ${historyFilter} files yet.`}</p>`;
 }
 
@@ -649,7 +658,7 @@ function handleMessage(connection: DataConnection, message: Message) {
 }
 
 function showOffer(offer: Offer) {
-  openModal(`<h2>${escapeHtml(offer.device.name)} wants to send you ${offer.files.length} file${offer.files.length > 1 ? 's' : ''}</h2><p>${formatBytes(offer.files.reduce((sum, file) => sum + file.size, 0))} in total. Only accept files from devices you trust.</p><div class="offer-files">${offer.files.map((file) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div><strong>${escapeHtml(file.name)}</strong><span>${formatBytes(file.size)}</span></div></div>`).join('')}</div><div class="offer-actions"><button class="secondary-button" data-action="decline-offer" data-batch="${escapeHtml(offer.batchId)}">No, thanks</button><button class="primary-button" data-action="accept-offer" data-batch="${escapeHtml(offer.batchId)}">${icon('arrow-down')}Accept files</button></div>`);
+  openModal(`<h2>${escapeHtml(offer.device.name)} wants to send you ${offer.files.length} file${offer.files.length > 1 ? 's' : ''}</h2><p>${formatBytes(offer.files.reduce((sum, file) => sum + file.size, 0))} in total. Only accept files from devices you trust.</p><div class="offer-files">${offer.files.map((file) => `<div class="file-row"><span class="file-icon">${icon(fileIcon(file.name))}</span><div>${fileNameHtml(file.name)}<span>${formatBytes(file.size)}</span></div></div>`).join('')}</div><div class="offer-actions"><button class="secondary-button" data-action="decline-offer" data-batch="${escapeHtml(offer.batchId)}">No, thanks</button><button class="primary-button" data-action="accept-offer" data-batch="${escapeHtml(offer.batchId)}">${icon('arrow-down')}Accept files</button></div>`);
   modalContent.dataset.offer = offer.batchId;
 }
 
