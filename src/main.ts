@@ -2,15 +2,17 @@ import Peer, { type DataConnection } from 'peerjs';
 import {
   createIcons, ArrowDown, ArrowUp, ArrowUpRight, Check, CheckCheck, ChevronDown, CircleHelp,
   Copy, Download, File, FileImage, FileText, Laptop, Link, LoaderCircle, Moon, Pencil, Plus,
-  RefreshCw, Send, Settings2, ShieldCheck, Smartphone, Sun, Tablet, X,
+  RefreshCw, Send, Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
 } from 'lucide';
-import { createCode, devicePlatform, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils';
+import { createCode, createVisibleClock, devicePlatform, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils';
+import { createScreenKeeper, type WakeState } from './wake';
+import { createVideoKeeper } from './wake-media';
 import './style.css';
 
 const iconSet = {
   ArrowDown, ArrowUp, ArrowUpRight, Check, CheckCheck, ChevronDown, CircleHelp, Copy, Download,
   File, FileImage, FileText, Laptop, Link, LoaderCircle, Moon, Pencil, Plus, RefreshCw, Send,
-  Settings2, ShieldCheck, Smartphone, Sun, Tablet, X,
+  Settings2, ShieldCheck, Smartphone, Sun, SunDim, Tablet, TriangleAlert, X,
 };
 const icon = (name: string, className = '') => `<i data-lucide="${name}" class="${className}" aria-hidden="true"></i>`;
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -37,6 +39,29 @@ const offers = new Map<string, Offer>();
 const acceptance = new Map<string, { peerId: string; resolve: (accepted: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
 let channel: BroadcastChannel | undefined;
 try { channel = new BroadcastChannel('relay-nearby-v1'); } catch { channel = undefined; }
+
+const CHUNK_SIZE = 64 * 1024;
+const BUFFER_HIGH = 1024 * 1024;
+const BUFFER_LOW = 256 * 1024;
+const STALL_LIMIT = 60000;
+const ACK_LIMIT = 60000;
+const RECEIVER_LIMIT = 240000;
+const SEND_REASON = 'sending';
+const RECEIVE_REASON = 'receiving';
+let keepAwake = localStorage.getItem('relay-keep-awake') !== 'off';
+let wakeWarned = false;
+const acknowledgements = new Map<string, { peerId: string; settle: (status: 'complete' | 'failed') => void }>();
+const screenKeeper = createScreenKeeper({
+  wakeLock: navigator.wakeLock ? { request: (type) => navigator.wakeLock.request(type) } : undefined,
+  media: createVideoKeeper(),
+  visible: () => document.visibilityState === 'visible',
+  onVisibilityChange: (listener) => {
+    document.addEventListener('visibilitychange', listener);
+    return () => document.removeEventListener('visibilitychange', listener);
+  },
+  enabled: keepAwake,
+  onChange: () => renderWake(),
+});
 
 interface Device {
   id: string;
@@ -99,6 +124,7 @@ app.innerHTML = `
   <header class="topbar">
     <a class="brand" href="#" aria-label="Relay home">${logo}<span>relay</span></a>
     <div class="topbar-actions">
+      <span id="wake-status" class="wake-status" data-wake-state="off" role="status" aria-live="polite" hidden></span>
       <span id="network-status" class="network-status"><span class="status-dot pending"></span><span>Connecting</span></span>
       <button class="icon-button" data-action="theme" aria-label="Switch color theme">${icon(theme === 'dark' ? 'sun' : 'moon')}</button>
       <button class="icon-button" data-action="help" aria-label="How it works">${icon('circle-help')}</button>
@@ -130,7 +156,7 @@ app.innerHTML = `
       <div class="card-heading"><h2 id="history-title">Transfers <span id="history-count" class="count-badge" hidden></span></h2><div class="history-tools"><div class="filters" role="group" aria-label="Filter transfers"><button class="filter-button" data-action="filter" data-filter="all">All</button><button class="filter-button" data-action="filter" data-filter="sent">Sent</button><button class="filter-button" data-action="filter" data-filter="received">Received</button></div><button id="clear-history" class="text-button" data-action="clear-history">Clear</button></div></div>
       <div id="history"></div>
     </section>
-    <p class="footnote">${icon('shield-check')}Files go directly between devices and are never stored on a server.</p>
+    <footer class="site-footer"><p>${icon('shield-check')}Files go directly between devices and are never stored on a server.</p><p>Built with <a href="https://github.com/bottomless/agent-duel" target="_blank" rel="noopener noreferrer">https://github.com/bottomless/agent-duel</a></p></footer>
   </main>
   <dialog id="modal" aria-labelledby="dialog-title"><div id="modal-content"></div></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -155,11 +181,49 @@ function refreshIcons() {
 }
 
 function render() {
+  syncWakeLock();
   query('#network-status').innerHTML = `<span class="status-dot ${networkReady ? '' : networkError ? 'error' : 'pending'}"></span><span>${networkReady ? 'Ready' : networkError ? 'Offline' : 'Connecting'}</span>`;
   query('#own-code').textContent = `${ownCode.slice(0, 3)} ${ownCode.slice(3)}`;
   renderSend();
   renderDevices();
   renderHistory();
+  renderWake();
+  refreshIcons();
+}
+
+function syncWakeLock() {
+  const sending = isSending || transfers.some((transfer) => transfer.direction === 'sent' && transfer.status === 'active');
+  const receiving = receivers.size > 0 || offers.size > 0 || transfers.some((transfer) => transfer.direction === 'received' && transfer.status === 'active');
+  if (sending) screenKeeper.hold(SEND_REASON);
+  else screenKeeper.release(SEND_REASON);
+  if (receiving) screenKeeper.hold(RECEIVE_REASON);
+  else screenKeeper.release(RECEIVE_REASON);
+}
+
+function renderWake() {
+  const element = query<HTMLElement>('#wake-status');
+  const state: WakeState = screenKeeper.getState();
+  const active = screenKeeper.isHolding() && state !== 'off';
+  element.hidden = !active;
+  element.dataset.wakeState = active ? state : 'off';
+  if (!active) { element.removeAttribute('title'); element.innerHTML = ''; return; }
+  const blocked = state === 'unsupported';
+  element.title = blocked
+    ? 'This browser cannot keep your screen on. Keep Relay visible until the transfer ends.'
+    : 'Your screen stays on while files move.';
+  element.innerHTML = `${icon(blocked ? 'triangle-alert' : 'sun')}<span>${blocked ? 'Keep your screen on' : 'Screen stays on'}</span>`;
+  refreshIcons();
+  if (blocked && keepAwake && !wakeWarned) {
+    wakeWarned = true;
+    toast('This browser cannot keep your screen on. Keep Relay visible during the transfer.', true);
+  }
+}
+
+function applyWakeSetting() {
+  const button = document.querySelector<HTMLButtonElement>('.wake-toggle');
+  if (!button) return;
+  button.setAttribute('aria-checked', String(keepAwake));
+  button.innerHTML = `${icon(keepAwake ? 'sun' : 'sun-dim')}${keepAwake ? 'On' : 'Off'}`;
   refreshIcons();
 }
 
@@ -243,11 +307,11 @@ function openModal(content: string) {
 }
 
 function helpModal() {
-  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Drop your files in, pick the device, and press Send.</p></li><li><h3>Accept and download</h3><p>Accept the transfer on the other device, then download each file.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Each transfer supports up to 2 GB, within available browser memory. If a direct route is unavailable, the transfer can use a network relay.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
+  openModal(`<h2>How it works</h2><ol class="help-steps"><li><h3>Connect</h3><p>Open this site on both devices. Enter one device’s code on the other device.</p></li><li><h3>Send</h3><p>Drop your files in, pick the device, and press Send.</p></li><li><h3>Accept and download</h3><p>Accept the transfer on the other device, then download each file.</p></li></ol><p class="help-detail">You always confirm before you receive files. WebRTC encrypts transfers. A public PeerJS server only helps the devices find each other and never stores files. Keep both tabs open. Relay keeps your screen on while files move, so a phone does not lock in the middle of a transfer. Time in a background tab does not count against a transfer. Each transfer supports up to 2 GB, within available browser memory. If a direct route is unavailable, the transfer can use a network relay.</p><button class="primary-button full-width" data-action="close-modal">Got it</button>`);
 }
 
 function settingsModal() {
-  openModal(`<h2>Settings</h2><form id="settings-form"><label for="device-name">Device name</label><input id="device-name" name="name" value="${escapeHtml(deviceName)}" maxlength="40" required /><span class="field-hint">Other devices see this name.</span><div class="setting-row"><span>Appearance</span><button type="button" class="secondary-button small theme-selector" data-action="theme">${icon(theme === 'light' ? 'sun' : 'moon')}${theme === 'light' ? 'Light' : 'Dark'}</button></div><button class="primary-button full-width" type="submit">Save changes</button></form>`);
+  openModal(`<h2>Settings</h2><form id="settings-form"><label for="device-name">Device name</label><input id="device-name" name="name" value="${escapeHtml(deviceName)}" maxlength="40" required /><span class="field-hint">Other devices see this name.</span><div class="setting-row"><span>Appearance</span><button type="button" class="secondary-button small theme-selector" data-action="theme">${icon(theme === 'light' ? 'sun' : 'moon')}${theme === 'light' ? 'Light' : 'Dark'}</button></div><div class="setting-row"><span>Keep the screen on<span class="setting-note">Stops your screen turning off during a transfer.</span></span><button type="button" class="secondary-button small wake-toggle" role="switch" aria-checked="${String(keepAwake)}" aria-label="Keep the screen on" data-action="toggle-keep-awake">${icon(keepAwake ? 'sun' : 'sun-dim')}${keepAwake ? 'On' : 'Off'}</button></div><button class="primary-button full-width" type="submit">Save changes</button></form>`);
   document.querySelector<HTMLFormElement>('#settings-form')?.addEventListener('submit', (event) => {
     event.preventDefault();
     const value = document.querySelector<HTMLInputElement>('#device-name')?.value.trim();
@@ -296,7 +360,7 @@ app.addEventListener('click', (event) => {
   const target = (event.target as HTMLElement).closest<HTMLElement>('[data-action]');
   if (!target || target.hasAttribute('disabled')) return;
   const action = target.dataset.action;
-  if (target.tagName === 'A') event.preventDefault();
+  if (target.tagName === 'A' && (target.getAttribute('href') || '').startsWith('#')) event.preventDefault();
   if (action === 'choose') fileInput.click();
   else if (action === 'remove-file') { selectedFiles.splice(Number(target.dataset.index), 1); render(); }
   else if (action === 'pair') focusPairing();
@@ -304,6 +368,15 @@ app.addEventListener('click', (event) => {
   else if (action === 'settings') settingsModal();
   else if (action === 'close-modal') modal.close();
   else if (action === 'theme') { theme = theme === 'light' ? 'dark' : 'light'; localStorage.setItem('relay-theme', theme); applyTheme(); }
+  else if (action === 'toggle-keep-awake') {
+    keepAwake = !keepAwake;
+    localStorage.setItem('relay-keep-awake', keepAwake ? 'on' : 'off');
+    if (!keepAwake) wakeWarned = false;
+    screenKeeper.setEnabled(keepAwake);
+    applyWakeSetting();
+    renderWake();
+    toast(keepAwake ? 'Relay will keep your screen on during transfers.' : 'Relay will not keep your screen on. Keep this tab visible.');
+  }
   else if (action === 'copy-code') void copyText(ownCode, 'Code copied. Enter it on your other device.');
   else if (action === 'copy-link') {
     const url = new URL(window.location.href);
@@ -447,7 +520,7 @@ function pairStatus(message: string, error = false) {
 }
 
 function registerConnection(connection: DataConnection) {
-  connection.on('open', () => connection.send(helloMessage()));
+  connection.on('open', () => { prepareFlowControl(connection); connection.send(helloMessage()); });
   connection.on('data', (data) => {
     if (!data || typeof data !== 'object' || !('type' in data)) return;
     const message = data as Message;
@@ -494,6 +567,9 @@ function registerConnection(connection: DataConnection) {
     for (const [id, offer] of offers) if (offer.device.id === connection.peer) offers.delete(id);
     for (const [id, pending] of acceptance) {
       if (pending.peerId === connection.peer) { clearTimeout(pending.timer); pending.resolve(false); acceptance.delete(id); }
+    }
+    for (const [id, pending] of acknowledgements) {
+      if (pending.peerId === connection.peer) { acknowledgements.delete(id); pending.settle('failed'); }
     }
     if (modalContent.dataset.offer && !offers.has(modalContent.dataset.offer)) modal.close();
     render();
@@ -567,6 +643,8 @@ function handleMessage(connection: DataConnection, message: Message) {
   } else if (message.type === 'complete' || message.type === 'failed') {
     const transfer = transfers.find((item) => item.id === message.id && item.direction === 'sent' && item.peerId === connection.peer);
     if (transfer) { transfer.status = message.type === 'complete' ? 'complete' : 'failed'; if (message.type === 'complete') transfer.progress = 100; render(); }
+    const pending = acknowledgements.get(message.id);
+    if (pending?.peerId === connection.peer) { acknowledgements.delete(message.id); pending.settle(message.type); }
   }
 }
 
@@ -590,10 +668,68 @@ function respondToOffer(batchId: string, accepted: boolean) {
   render();
 }
 
+function prepareFlowControl(connection: DataConnection) {
+  const channel = connection.dataChannel;
+  if (channel && 'bufferedAmountLowThreshold' in channel) channel.bufferedAmountLowThreshold = BUFFER_LOW;
+}
+
+function isBackpressured(connection: DataConnection): boolean {
+  const channel = connection.dataChannel;
+  if (channel && channel.bufferedAmount > BUFFER_HIGH) return true;
+  return 'bufferSize' in connection && Number(connection.bufferSize) > 8;
+}
+
+function waitForDrain(connection: DataConnection): Promise<void> {
+  const channel = connection.dataChannel;
+  if (!channel) return Promise.resolve();
+  return new Promise((resolve) => {
+    const listener = () => { clearTimeout(timer); channel.removeEventListener('bufferedamountlow', listener); resolve(); };
+    const timer = setTimeout(listener, 1000);
+    channel.addEventListener('bufferedamountlow', listener);
+    if (!isBackpressured(connection)) listener();
+  });
+}
+
+async function waitForRoom(connection: DataConnection) {
+  const clock = createVisibleClock(() => document.visibilityState === 'visible');
+  let lastBuffered = -1;
+  while (isBackpressured(connection)) {
+    if (!connection.open) throw new Error('The device disconnected.');
+    const buffered = connection.dataChannel?.bufferedAmount ?? -1;
+    if (buffered !== lastBuffered) { lastBuffered = buffered; clock.reset(); }
+    if (clock.tick() > STALL_LIMIT) throw new Error('The connection stalled.');
+    await waitForDrain(connection);
+  }
+}
+
+function waitForAcknowledgement(id: string, connection: DataConnection): Promise<'complete' | 'failed'> {
+  return new Promise((resolve, reject) => {
+    const clock = createVisibleClock(() => document.visibilityState === 'visible');
+    const watch = { timer: undefined as ReturnType<typeof setInterval> | undefined, settled: false };
+    const stop = () => { watch.settled = true; acknowledgements.delete(id); clearInterval(watch.timer); };
+    const finish = (status: 'complete' | 'failed') => {
+      if (watch.settled) return;
+      stop();
+      resolve(status);
+    };
+    const abort = (message: string) => {
+      if (watch.settled) return;
+      stop();
+      reject(new Error(message));
+    };
+    acknowledgements.set(id, { peerId: connection.peer, settle: finish });
+    watch.timer = setInterval(() => {
+      if (!connection.open) { abort('The device disconnected.'); return; }
+      if (clock.tick() > ACK_LIMIT) abort('The transfer did not complete.');
+    }, 250);
+  });
+}
+
 let lastProgressRender = 0;
 function updateProgress(id: string, progress: number) {
   const transfer = transfers.find((item) => item.id === id);
   if (transfer) transfer.progress = Math.min(99, progress);
+  if (document.hidden) return;
   if (Date.now() - lastProgressRender > 150) { render(); lastProgressRender = Date.now(); }
 }
 
@@ -606,6 +742,7 @@ async function sendFiles() {
   const files = [...selectedFiles];
   const batchId = crypto.randomUUID();
   const fileInfos = files.map((file) => ({ id: crypto.randomUUID(), name: file.name, size: file.size, mime: file.type }));
+  prepareFlowControl(device.connection);
   render();
   toast(`Waiting for ${device.name} to accept.`);
   try {
@@ -624,24 +761,17 @@ async function sendFiles() {
       const info = fileInfos[index];
       transfers.unshift({ id: info.id, name: info.name, size: info.size, device: device.name, peerId: device.id, direction: 'sent', status: 'active', progress: 0, time: Date.now() });
       render();
-      const chunkSize = 64 * 1024;
-      for (let offset = 0; offset < file.size; offset += chunkSize) {
+      for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
         if (!device.connection.open) throw new Error('The device disconnected.');
-        const drainStart = Date.now();
-        while (device.connection.dataChannel.bufferedAmount > 1024 * 1024 || ('bufferSize' in device.connection && Number(device.connection.bufferSize) > 8)) {
-          if (!device.connection.open || Date.now() - drainStart > 30000) throw new Error('The connection timed out.');
-          await new Promise((resolve) => setTimeout(resolve, 15));
-        }
-        const data = await file.slice(offset, offset + chunkSize).arrayBuffer();
+        await waitForRoom(device.connection);
+        const data = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
+        if (!device.connection.open) throw new Error('The device disconnected.');
         device.connection.send({ type: 'chunk', id: info.id, data });
-        updateProgress(info.id, Math.min(file.size, offset + chunkSize) / file.size * 100);
+        updateProgress(info.id, Math.min(file.size, offset + CHUNK_SIZE) / file.size * 100);
       }
+      const acknowledged = waitForAcknowledgement(info.id, device.connection);
       device.connection.send({ type: 'end', id: info.id });
-      const completionStart = Date.now();
-      while (transfers.find((item) => item.id === info.id)?.status !== 'complete') {
-        if (!device.connection.open || transfers.find((item) => item.id === info.id)?.status === 'failed' || Date.now() - completionStart > 30000) throw new Error('The transfer did not complete.');
-        await new Promise((resolve) => setTimeout(resolve, 30));
-      }
+      if (await acknowledged !== 'complete') throw new Error('The transfer did not complete.');
     }
     selectedFiles = [];
     toast('All files arrived.');
@@ -651,9 +781,10 @@ async function sendFiles() {
       const transfer = transfers.find((item) => item.id === info.id);
       if (transfer?.status === 'active') transfer.status = 'failed';
     }
-    toast('The transfer stopped. Check your connection and try again.', true);
+    toast('The transfer stopped. Your files are still selected, so press Send to try again.', true);
   } finally {
     isSending = false;
+    for (const info of fileInfos) acknowledgements.delete(info.id);
     render();
   }
 }
@@ -676,7 +807,7 @@ if (channel) {
     for (const [id, device] of nearby) if (Date.now() - device.lastSeen > 25000) { nearby.delete(id); render(); }
   }, 10000);
 }
-setInterval(() => {
+function sweepTimeouts() {
   let changed = false;
   for (const [id, offer] of offers) {
     if (Date.now() - offer.receivedAt > 120000) {
@@ -686,7 +817,7 @@ setInterval(() => {
     }
   }
   for (const [id, receiver] of receivers) {
-    if (Date.now() - receiver.lastSeen > 240000) {
+    if (Date.now() - receiver.lastSeen > RECEIVER_LIMIT) {
       const transfer = transfers.find((item) => item.id === id);
       if (transfer) transfer.status = 'failed';
       receivers.delete(id);
@@ -694,7 +825,17 @@ setInterval(() => {
     }
   }
   if (changed) render();
-}, 10000);
+}
+
+setInterval(() => { if (document.visibilityState === 'visible') sweepTimeouts(); }, 10000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const resumed = Date.now();
+  for (const receiver of receivers.values()) receiver.lastSeen = resumed;
+  lastProgressRender = 0;
+  sweepTimeouts();
+  render();
+});
 window.addEventListener('beforeunload', () => channel?.postMessage({ type: 'goodbye', id: `relay-${ownCode}`, sessionId }));
 applyTheme();
 render();

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createCode, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils.ts';
+import { createCode, createVisibleClock, escapeHtml, formatBytes, isValidOffer, normalizeBinary, normalizeCode } from './utils.ts';
 
 test('file sizes use readable binary units', () => {
   assert.equal(formatBytes(0), '0 B');
@@ -94,4 +94,32 @@ test('offers have bounded file counts and file metadata', () => {
   const invalidName = offer();
   invalidName.files[0].name = 'a'.repeat(256);
   assert.equal(isValidOffer(invalidName), false);
+});
+
+test('a hidden page adds no time to the stall clock', () => {
+  let now = 1000;
+  let visible = true;
+  const clock = createVisibleClock(() => visible, () => now);
+  now = 2000;
+  assert.equal(clock.tick(), 1000);
+  visible = false;
+  now = 600000;
+  assert.equal(clock.tick(), 1000);
+  assert.equal(clock.elapsed(), 1000);
+  visible = true;
+  now = 601000;
+  assert.equal(clock.tick(), 2000);
+  clock.reset();
+  assert.equal(clock.elapsed(), 0);
+  now = 620000;
+  assert.equal(clock.tick(), 19000);
+});
+
+test('the stall clock never runs backwards', () => {
+  let now = 5000;
+  const clock = createVisibleClock(() => true, () => now);
+  now = 4000;
+  assert.equal(clock.tick(), 0);
+  now = 4500;
+  assert.equal(clock.tick(), 500);
 });

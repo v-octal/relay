@@ -94,15 +94,96 @@ try {
   for await (const chunk of binaryStream) binaryChunks.push(chunk);
   assert.equal(Buffer.compare(Buffer.concat(binaryChunks), binary), 0);
 
+  const filler = (size) => Buffer.alloc(size, 7);
+  const wakeChip = (page) => page.evaluate(() => {
+    const chip = document.querySelector('#wake-status');
+    const video = document.querySelector('video.wake-video');
+    return { state: chip.dataset.wakeState, hidden: chip.hidden, mediaPlaying: Boolean(video?.muted && !video.paused) };
+  });
+  const showChip = (page) => page.waitForFunction(() => {
+    const chip = document.querySelector('#wake-status');
+    return Boolean(chip && !chip.hidden);
+  }, undefined, { timeout: 20000 });
+
+  await sender.locator('#file-input').setInputFiles({ name: 'awake.bin', mimeType: 'application/octet-stream', buffer: filler(8 * 1024 * 1024) });
+  await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).click();
+  await receiver.getByRole('button', { name: 'Accept files' }).waitFor();
+  await receiver.getByRole('button', { name: 'Accept files' }).click();
+  await showChip(receiver);
+  await showChip(sender);
+  const holding = await wakeChip(receiver);
+  assert.equal(holding.hidden, false);
+  assert.equal(holding.state === 'on' || (holding.state === 'media' && holding.mediaPlaying), true);
+  await receiver.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 4, undefined, { timeout: 60000 });
+  await sender.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 4, undefined, { timeout: 60000 });
+  for (const page of [sender, receiver]) {
+    const idle = await wakeChip(page);
+    assert.equal(idle.hidden, true);
+    assert.equal(idle.mediaPlaying, false);
+  }
+
+  await sender.evaluate(() => {
+    window.__relayTimers = {
+      timeout: window.setTimeout.bind(window),
+      interval: window.setInterval.bind(window),
+      visibilityState: Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState'),
+      hidden: Object.getOwnPropertyDescriptor(Document.prototype, 'hidden'),
+    };
+    window.setTimeout = (handler, delay, ...args) => window.__relayTimers.timeout(handler, Math.max(Number(delay) || 0, 60000), ...args);
+    window.setInterval = (handler, delay, ...args) => window.__relayTimers.interval(handler, Math.max(Number(delay) || 0, 60000), ...args);
+    Object.defineProperty(Document.prototype, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: () => true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  assert.equal(await sender.evaluate(() => document.hidden), true);
+  await sender.locator('#file-input').setInputFiles({ name: 'background.bin', mimeType: 'application/octet-stream', buffer: filler(12 * 1024 * 1024) });
+  await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).click();
+  await receiver.getByRole('button', { name: 'Accept files' }).waitFor();
+  await receiver.getByRole('button', { name: 'Accept files' }).click();
+  await receiver.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 5, undefined, { timeout: 60000 });
+  await sender.evaluate(() => {
+    const saved = window.__relayTimers;
+    window.setTimeout = saved.timeout;
+    window.setInterval = saved.interval;
+    Object.defineProperty(Document.prototype, 'visibilityState', saved.visibilityState);
+    Object.defineProperty(Document.prototype, 'hidden', saved.hidden);
+    window.__relayTimers = undefined;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await sender.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 5, undefined, { timeout: 30000 });
+  assert.equal(await sender.locator('.transfer-status.failed').count(), 0);
+
+  await sender.getByRole('button', { name: 'Settings', exact: true }).click();
+  const wakeSetting = sender.getByRole('switch', { name: 'Keep the screen on' });
+  assert.equal(await wakeSetting.getAttribute('aria-checked'), 'true');
+  await wakeSetting.click();
+  assert.equal(await wakeSetting.getAttribute('aria-checked'), 'false');
+  await sender.getByRole('button', { name: 'Save changes' }).click();
+  assert.equal(await sender.evaluate(() => localStorage.getItem('relay-keep-awake')), 'off');
+
+  await sender.locator('#file-input').setInputFiles({ name: 'no-wake.txt', mimeType: 'text/plain', buffer: Buffer.from('Screen setting is off.\n') });
+  await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).click();
+  await sender.waitForTimeout(400);
+  assert.equal((await wakeChip(sender)).hidden, true);
+  await receiver.getByRole('button', { name: 'Accept files' }).waitFor();
+  await receiver.getByRole('button', { name: 'Accept files' }).click();
+  await receiver.waitForFunction(() => document.querySelectorAll('.transfer-status.complete').length === 6, undefined, { timeout: 60000 });
+  assert.equal((await wakeChip(sender)).hidden, true);
+
+  await sender.getByRole('button', { name: 'Settings', exact: true }).click();
+  await sender.getByRole('switch', { name: 'Keep the screen on' }).click();
+  assert.equal(await sender.evaluate(() => localStorage.getItem('relay-keep-awake')), 'on');
+  await sender.getByRole('button', { name: 'Save changes' }).click();
+
   await sender.locator('#file-input').setInputFiles({ name: 'declined.txt', mimeType: 'text/plain', buffer: Buffer.from('Not accepted.') });
   await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).click();
   await receiver.getByRole('button', { name: 'No, thanks' }).click();
   await sender.getByRole('button', { name: 'Send 1 file to Living room tablet', exact: true }).waitFor();
-  assert.equal(await receiver.locator('.transfer-row').count(), 3);
+  assert.equal(await receiver.locator('.transfer-row').count(), 6);
   await receiver.getByRole('button', { name: 'Disconnect Studio laptop', exact: true }).click();
   await sender.waitForFunction(() => !document.querySelector('.connected-label'));
   assert.deepEqual(errors, []);
-  console.log('Passed: desktop, mobile, theme, settings, history, pairing, text/binary/empty file transfers, download integrity, decline, and disconnect.');
+  console.log('Passed: desktop, mobile, theme, settings, history, pairing, text/binary/empty file transfers, download integrity, screen wake lock, hidden-tab transfers, keep-awake setting, decline, and disconnect.');
 } catch (error) {
   console.error('Browser errors:', errors);
   for (const [index, page] of context.pages().entries()) {

@@ -62,6 +62,30 @@ export function isValidOffer(value: unknown): value is { batchId: string; files:
   return true;
 }
 
+export interface VisibleClock {
+  tick(): number;
+  reset(): void;
+  elapsed(): number;
+}
+
+export function createVisibleClock(isVisible: () => boolean, now: () => number = () => Date.now()): VisibleClock {
+  let total = 0;
+  let last = now();
+  return {
+    tick() {
+      const current = now();
+      if (isVisible()) total += Math.max(0, current - last);
+      last = current;
+      return total;
+    },
+    reset() {
+      total = 0;
+      last = now();
+    },
+    elapsed: () => total,
+  };
+}
+
 export function devicePlatform(): { name: string; os: string; browser: string; kind: string } {
   const agent = navigator.userAgent;
   const os = /iPad|iPhone/.test(agent) ? 'iOS' : /Android/.test(agent) ? 'Android' : /Mac/.test(agent) ? 'macOS' : /Windows/.test(agent) ? 'Windows' : 'Linux';
